@@ -262,7 +262,10 @@ def evaluate(p):
                     "upstream": [f"{d}:bypass_on", f"{d}:bypass_off"]})
                 on = None
         if on:
-            hidden = [g for g in gaps.get(d, []) if g["to_ts"] >= on["ts"]]
+            # 依据同一设备的 seq 先后判断：bypass_on 之后的缺号区间
+            # 可能藏着 bypass_off（时间戳倒序不影响 seq 次序）
+            hidden = [g for g in gaps.get(d, [])
+                      if g["from_seq"] > on.get("seq", 0)]
             if hidden:  # 缺号区间可能藏着 bypass_off，不得直接判未复位
                 bypass_findings.append({
                     "device": d, "on": on["ts"], "off": None,

@@ -140,6 +140,28 @@ class BypassGapTest(unittest.TestCase):
         self.assertEqual(b["status"], "fail")
         self.assertEqual(b["type"], "bypass_not_reset")
 
+    def test_inverted_timestamp_gap_after_on_keeps_unknown(self):
+        # bypass_on seq=1 ts=300，后续 seq=3 ts=200（时间戳倒序）：
+        # 缺失的 seq=2 可能记录 bypass_off -> unknown，不得判 fail
+        r = self._run([
+            {"device": "R1", "seq": 1, "signal": "bypass_on", "device_ts": 300},
+            {"device": "R1", "seq": 3, "signal": "run", "device_ts": 200}])
+        b = r["bypass"][0]
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["reason"], "log_gap")
+        self.assertEqual(b["gap"]["from_seq"], 2)
+        self.assertEqual(r["status"], "unknown")
+
+    def test_preceding_gap_does_not_mask_unreset(self):
+        # 缺口(seq=2)位于 bypass_on(seq=3) 之前，不影响未复位判定 -> fail
+        r = self._run([
+            {"device": "R1", "seq": 1, "signal": "run", "device_ts": 100},
+            {"device": "R1", "seq": 3, "signal": "bypass_on", "device_ts": 200},
+            {"device": "R1", "seq": 4, "signal": "run", "device_ts": 300}])
+        b = r["bypass"][0]
+        self.assertEqual(b["status"], "fail")
+        self.assertEqual(b["type"], "bypass_not_reset")
+
     def test_reset_inside_gap_free_log_stays_ok(self):
         r = self._run([
             {"device": "R1", "seq": 1, "signal": "bypass_on", "device_ts": 100},
