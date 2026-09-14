@@ -343,12 +343,6 @@ def evaluate(p):
                     return r
             return None
 
-        def gap_after_seq(dev, from_seq):
-            for g in gaps.get(dev, []):
-                if g["from_seq"] > from_seq:
-                    return g
-            return None
-
         # ---- 每路叶子（或手报）按 seq/ts 切分置位轮次：
         #      重复置位并入同一轮；保持时长内复位 = 触点抖动，丢弃；
         #      相关 seq 缺口可能藏复位/置位 -> 该轮 unknown。
@@ -380,6 +374,26 @@ def evaluate(p):
                 return "bounce"  # 保持时长内复位 => 触点抖动，丢弃该轮
 
             eps, on = [], None
+
+            def round_start_before(ts):
+                """ts 之前最近一次全局复位时刻（本轮起点），无则负无穷。"""
+                last = -(10**18)
+                for r in reset_ts:
+                    if r < ts:
+                        last = r
+                    else:
+                        break
+                return last
+
+            def prior_gap_for(e):
+                """本轮起点之后、本次置位之前的 seq 缺口：可能藏更早的
+                置位/复位 -> 该轮 unknown。起点（复位）之前的旧缺口不算。"""
+                lo = round_start_before(e["ts"])
+                for g in gaps.get(dev, []):
+                    if g["to_seq"] < e["seq"] and g["to_ts"] > lo:
+                        return g
+                return None
+
             for e in stream:
                 relevant = e["signal"] == sig or (
                     local_reset_sig and e["signal"] == local_reset_sig)
@@ -399,18 +413,15 @@ def evaluate(p):
                               "gap": None, "stable": is_manual, "mi": None,
                               "manual": is_manual,
                               "used": False, "dead": False, "banned": False}
-                    elif local_reset_sig:
-                        on["repeats"] += 1   # 有独立复位信号：重复置位=同轮
+                        pg = prior_gap_for(e)
+                        if pg is not None:
+                            # 本轮起点后的 seq 缺口可能藏更早置位/复位
+                            on["gap"] = pg
+                            on["stable"] = False
                     else:
-                        # 无独立复位信号：上一置位轮在本点关轮，本次另起，
-                        # 但记为前一轮的重复置位（触点抖动去重）
-                        on["reset"] = {"ts": e["ts"], "seq": e.get("seq"),
-                                       "synthetic": True}
-                        eps.append(on)
-                        on = {"set": e, "reset": None, "repeats": 0,
-                              "gap": None, "stable": is_manual, "mi": None,
-                              "manual": is_manual,
-                              "used": False, "dead": False, "banned": False}
+                        # 仍处置位（既无全局复位也无本机复位）就重复收到置位：
+                        # 触点抖动/重复上报，并入同一轮，不得另算一次火警。
+                        on["repeats"] += 1
                     continue
                 if on is not None:
                     if settle(on, e["ts"], False) == "ok":
@@ -425,18 +436,26 @@ def evaluate(p):
                 elif gr is not None:
                     on = None
             if on is not None and not on["stable"]:
-                tg = gap_after_seq(dev, on["set"]["seq"])
+                # 本轮起点之后、置位之后的缺口才可能藏本轮复位/置位；
+                # 复位之前的旧缺口不得算到本轮头上。
+                lo = round_start_before(on["set"]["ts"])
+                tg = next((g for g in gaps.get(dev, [])
+                           if g["from_seq"] > on["set"]["seq"]
+                           and g["from_ts"] >= on["set"]["ts"]
+                           and g["from_ts"] > lo), None)
                 if tg:
                     on["gap"] = tg
                 else:
                     # 保持证据只认本机参与信号事件（面板复位不算）：
-                    # 后续日志覆盖到保持时长之外 => 置位坐实稳定；
-                    # 否则保持证据不完整（窗口敞开），保留 unknown 嫌疑。
+                    # 后续同信号置位（含重复上报）或本机复位覆盖到保持
+                    # 时长之外 => 置位坐实稳定；否则保持证据不完整
+                    # （窗口敞开），保留 unknown 嫌疑。
                     sigs = {sig}
                     if local_reset_sig:
                         sigs.add(local_reset_sig)
-                    tail_to = max((x["ts"] for x in later_events(on["set"]["seq"])
-                                   if x["signal"] in sigs), default=None)
+                    tail_to = max((x["ts"] for x in stream
+                                   if x["seq"] >= on["set"]["seq"]
+                                   and x["signal"] in sigs), default=None)
                     if tail_to is not None \
                             and tail_to - on["set"]["ts"] >= eff_hold:
                         on["stable"] = True
@@ -496,12 +515,14 @@ def evaluate(p):
                         return False, [], None, \
                             [leaf_gap(mi, "clock_residual_out_of_bounds")]
                     # 仍处于置位（无复位）的轮次必须晚于游标，避免上一轮
-                    # 的旧置位被滑窗再次确认；已复位轮次从本轮起点之后取
+                    # 的旧置位被滑窗再次确认；已复位轮次从本轮起点起可取，
+                    # 锚点（恰在 lo 的置位）也算本轮候选。
                     def fresh(ep):
-                        if ep["set"]["ts"] <= lo:
+                        if ep["set"]["ts"] < lo:
                             return False
-                        if ep["reset"] is None:
-                            return ep["set"]["ts"] > after_ts
+                        if ep["reset"] is None \
+                                and ep["set"]["ts"] <= after_ts:
+                            return False
                         return True
                     cands = [ep for ep in (pools[mi] or [])
                              if not (ep["used"] or ep["dead"] or ep["banned"])
@@ -573,6 +594,23 @@ def evaluate(p):
         cursor = -10**18
         raw = []
         all_pools = [p for p in pools if p] + [manual_pool]
+        reported_gaps = set()   # 同一 seq 缺口在滑动窗口中只立一次 unknown
+
+        def gap_key(g):
+            gp = g.get("gap") or {}
+            return (g.get("member"), gp.get("from_seq"), gp.get("to_seq"))
+
+        def take_gaps(gs):
+            """登记并返回尚未上报的缺口；同一缺口不重复立案。"""
+            fresh = []
+            for g in gs:
+                if g.get("reason") == "log_gap":
+                    k = gap_key(g)
+                    if k in reported_gaps:
+                        continue
+                    reported_gaps.add(k)
+                fresh.append(g)
+            return fresh
 
         def member_view(chosen):
             out = []
@@ -593,22 +631,8 @@ def evaluate(p):
                     if not ep["used"] and ep["set"]["ts"] < close:
                         ep["dead"] = True
 
-        def close_open_after(chosen_list, cutoff):
-            """无全局复位确认后：把被消费各路仍敞开的置位在 cutoff 处关轮，
-            这样同一信号后续再置位才能在 build 流里另起一轮（复位后再报警）。"""
-            for ch in chosen_list:
-                if ch["reset"] is not None:
-                    continue
-                dev = manual_ep["device"] if ch["manual"] else leaves[ch["mi"]]["device"]
-                sig = manual_ep["signal"] if ch["manual"] else leaves[ch["mi"]]["signal"]
-                later = [e for e in by_dev.get(dev, [])
-                         if e["seq"] > ch["set"]["seq"] and e["signal"] == sig]
-                if not later:
-                    continue
-                ch["reset"] = {"ts": later[0]["ts"], "seq": later[0]["seq"],
-                               "synthetic": True}
-
-        def hold_failure(chosen, t0v):            """确认后复核保持时长：某路在 t0+hold 前复位（且无缺口嫌疑）
+        def hold_failure(chosen, t0v):
+            """确认后复核保持时长：某路在 t0+hold 前复位（且无缺口嫌疑）
             => 整轮按抖动废弃；有缺口 => 该轮 unknown。"""
             for ep in chosen:
                 if ep["manual"]:
@@ -637,6 +661,31 @@ def evaluate(p):
                          "repeat_sets": manual_ch["repeats"]}],
                     "cap": cap}
 
+        def round_gap_suspects(a_ts, hi):
+            """收集本轮相关的成员缺口：缺口在游标之后、且可能影响本轮确认
+            （缺口与 [a_ts, hi] 重叠、位于本轮置位之前、或夹在本轮置位与
+            确认点之间），尚未上报的逐项列出。"""
+            out = []
+            for pool in all_pools:
+                for ep in pool:
+                    if not ep.get("gap") or ep.get("gap_reported"):
+                        continue
+                    if ep["used"] or ep["banned"]:
+                        continue
+                    g = ep["gap"]
+                    # 缺口在游标之后，且其时间区间不晚于本轮确认上界：
+                    # 缺口里可能藏着更早置位/复位或窗口内的置位 -> 相关
+                    relevant = (g["to_ts"] > cursor
+                                and g["from_ts"] <= hi
+                                and not (ep["used"] or ep["dead"]))
+                    if not relevant:
+                        continue
+                    who = (f"{manual_ep['device']}:{manual_ep['signal']}"
+                           if ep["manual"] else label(ep["mi"]))
+                    out.append({"member": who, "reason": "log_gap", "gap": g})
+                    ep["gap_reported"] = True
+            return take_gaps(out)
+
         while True:
             avail = [ep for pool in all_pools for ep in pool
                      if not (ep["used"] or ep["dead"] or ep["banned"])
@@ -651,25 +700,34 @@ def evaluate(p):
                 if not pending:
                     break
                 ep0 = min(pending, key=lambda e: e["set"]["ts"])
+                gapped = [ep for pool in all_pools for ep in pool
+                          if ep.get("gap") and not (ep["used"] or ep["banned"])
+                          and not ep.get("gap_reported")
+                          and ep["set"]["ts"] > cursor]
                 gs0 = []
-                for pool in all_pools:
-                    for ep in pool:
-                        if ep["gap"] and ep["set"]["ts"] > cursor:
-                            who = (f"{manual_ep['device']}:{manual_ep['signal']}"
-                                   if ep["manual"] else label(ep["mi"]))
-                            gs0.append({"member": who, "reason": "log_gap",
-                                        "gap": ep["gap"]})
-                if not gs0:
-                    close0 = next_reset_after(ep0["set"]["ts"])
-                    if close0 is None:
-                        who = (f"{manual_ep['device']}:{manual_ep['signal']}"
-                               if ep0["manual"] else label(ep0["mi"]))
-                        gs0 = [{"member": who,
-                                "reason": "hold_evidence_incomplete"}]
+                for ep in gapped:
+                    who = (f"{manual_ep['device']}:{manual_ep['signal']}"
+                           if ep["manual"] else label(ep["mi"]))
+                    gs0 += take_gaps([{"member": who, "reason": "log_gap",
+                                       "gap": ep["gap"]}])
+                    ep["gap_reported"] = True
                 if gs0:
                     raw.append(make_raw(ep0["set"]["ts"], gs0,
                                         "manual" if ep0["manual"] else "composite",
                                         next_reset_after(ep0["set"]["ts"])))
+                    # 缺口轮保留（不判死），仅推进游标，避免滑窗重复立案；
+                    # 其后若仍有置位可继续形成新轮。
+                    cursor = ep0["set"]["ts"]
+                    continue
+                close0 = next_reset_after(ep0["set"]["ts"])
+                if close0 is None:
+                    who = (f"{manual_ep['device']}:{manual_ep['signal']}"
+                           if ep0["manual"] else label(ep0["mi"]))
+                    raw.append(make_raw(
+                        ep0["set"]["ts"],
+                        [{"member": who, "reason": "hold_evidence_incomplete"}],
+                        "manual" if ep0["manual"] else "composite", close0))
+                # 无缺口的非稳定置位（保持不足/偶发）：判死后窗口继续滑动
                 for ep in pending:
                     ep["dead"] = True
                 cursor = ep0["set"]["ts"]
@@ -688,12 +746,13 @@ def evaluate(p):
             if mans:
                 m_ep = min(mans, key=lambda ep: ep["set"]["ts"])
                 if m_ep.get("gap"):
-                    raw.append(make_raw(m_ep["set"]["ts"],
-                                        [{"member": f"{manual_ep['device']}:"
-                                                    f"{manual_ep['signal']}",
-                                          "reason": "log_gap",
-                                          "gap": m_ep["gap"]}],
-                                        "manual", close, manual_ch=m_ep))
+                    mgaps = take_gaps([{"member": f"{manual_ep['device']}:"
+                                                   f"{manual_ep['signal']}",
+                                        "reason": "log_gap",
+                                        "gap": m_ep["gap"]}])
+                    if mgaps:
+                        raw.append(make_raw(m_ep["set"]["ts"], mgaps,
+                                            "manual", close, manual_ch=m_ep))
                 else:
                     m_ep["used"] = True
                     raw.append(make_raw(m_ep["set"]["ts"], [], "manual",
@@ -706,6 +765,20 @@ def evaluate(p):
                 continue
 
             sat, chosen, t0v, gs = solve_window(a_ts, a_ts, hi, cursor)
+            round_gaps = round_gap_suspects(a_ts, hi)
+            if sat and round_gaps:
+                # 组合虽凑齐，但参与设备本轮相关日志有缺口（可能藏更早/
+                # 复位事件）-> 该实例保持 unknown
+                raw.append(make_raw(t0v, round_gaps, "composite", close))
+                for ch in chosen:
+                    ch["used"] = True
+                if close is not None:
+                    # 本轮（复位之前）其余置位一并封存，复位后另起一轮
+                    kill_round(close)
+                    cursor = close
+                else:
+                    cursor = t0v
+                continue
             if sat:
                 hfail, hgaps = hold_failure(chosen, t0v)
                 if hfail == "bounce":
@@ -717,8 +790,14 @@ def evaluate(p):
                 for ch in chosen:
                     ch["used"] = True
                 if hfail == "unknown":
-                    raw.append(make_raw(t0v, hgaps, "composite", close,
-                                        chosen=chosen))
+                    hgaps = take_gaps(hgaps)
+                    if hgaps:
+                        raw.append(make_raw(t0v, hgaps, "composite", close,
+                                            chosen=chosen))
+                    else:
+                        # 缺口已在更早窗口立案：本轮不再重复，置位判死
+                        for ch in chosen:
+                            ch["used"] = True
                 else:
                     raw.append(make_raw(t0v, [], "composite", close,
                                         chosen=chosen))
@@ -735,22 +814,26 @@ def evaluate(p):
                         ch["set"]["ts"] for ch in chosen)
                 continue
 
-            # 未确认：仅在有缺口嫌疑或窗口仍敞开（参与设备毫无日志）时
-            # 立 unknown；窗口已在覆盖期内闭合 = 偶发未凑齐，不立案，
-            # 锚点判死后窗口继续滑动（同一报警不得被滑窗重复计算）。
+            # 未确认：仅在有缺口嫌疑/校时不可信/窗口仍敞开时立 unknown；
+            # 窗口已在覆盖期内闭合 = 偶发未凑齐，不立案，锚点判死后窗口
+            # 继续滑动（同一报警不得被滑窗重复计算）。
             gap_suspect = any(g["reason"] in ("log_gap",
                                               "clock_residual_out_of_bounds")
                               for g in gs)
             uncovered = [mi for mi in range(len(leaves))
                          if mi not in clock_members
                          and leaves[mi]["device"] not in by_dev]
-            if gap_suspect or (not close and uncovered):
-                gaps_out = [g for g in gs
-                            if g["reason"] in ("log_gap",
-                                               "clock_residual_out_of_bounds")]
+            if round_gaps or gap_suspect or (not close and uncovered):
+                gaps_out = list(round_gaps)
+                gaps_out += take_gaps([g for g in gs
+                                       if g["reason"] == "log_gap"])
+                gaps_out += [g for g in gs
+                             if g["reason"] == "clock_residual_out_of_bounds"]
                 gaps_out += [{"member": label(mi), "reason": "window_open"}
                              for mi in uncovered]
-                raw.append(make_raw(a_ts, gaps_out, "composite", close))
+                gaps_out = dedup_gaps(gaps_out)
+                if gaps_out:
+                    raw.append(make_raw(a_ts, gaps_out, "composite", close))
             anchor["dead"] = True
             cursor = a_ts
 
@@ -1057,7 +1140,8 @@ def make_app(db_path):
             return 409, {"error": "已签结，矩阵/事件/别名映射已冻结，拒绝新修订"}
         just = (body.get("justification") or "").strip()
         if not just:
-            return 400, {"error": "重绑设备或改时钟锚点必须给出 justification 依据"}
+            return 400, {"error": "重绑设备、改时钟锚点或改触发/复合规则"
+                                 "必须给出 justification 依据"}
         cur = conn.execute("SELECT MAX(rev) FROM revisions WHERE project=?",
                            (pid,)).fetchone()[0]
         base = get_rev(conn, pid, cur)["payload"]

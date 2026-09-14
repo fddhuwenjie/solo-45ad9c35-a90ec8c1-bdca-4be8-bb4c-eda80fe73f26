@@ -309,5 +309,390 @@ class LifecycleHttpTest(unittest.TestCase):
         self.assertEqual(code, 409)
 
 
+def composite_payload(**kw):
+    """复合触发现代化载荷：两只烟感 k_of_n(2) + 面板复位 + 手报旁路。"""
+    devs = {"D1": {"type": "smoke"}, "D2": {"type": "smoke"},
+            "M1": {"type": "manual"}, "P1": {"type": "panel"},
+            "V1": {"type": "valve"}}
+    comp = kw.pop("composite", {
+        "k_of_n": [{"device": "D1", "signal": "alarm"},
+                   {"device": "D2", "signal": "alarm"}], "k": 2,
+        "window_ms": 30000, "hold_ms": 500,
+        "reset": {"device": "P1", "signal": "reset"},
+        "manual": {"device": "M1", "signal": "alarm"}})
+    p = {
+        "sync_tolerance_ms": 150,
+        "devices": devs,
+        "aliases": {},
+        "matrix": [{"id": "C", "composite": comp,
+                    "respond": kw.pop("respond", [])}],
+        "sync_pulses": [{"device": d, "device_ts": 0, "master_ts": 0}
+                        for d in devs],
+        "events": kw.pop("events", []),
+    }
+    p.update(kw)
+    return p
+
+
+def cev(d, sig, ts, seq=1):
+    return {"device": d, "seq": seq, "signal": sig, "device_ts": ts}
+
+
+class CompositeConfirmTest(unittest.TestCase):
+    """all / any / k_of_n 在确认窗口内凑齐 -> 生成实例并 pass。"""
+
+    def _rule(self, op, k=None):
+        children = [{"device": "D1", "signal": "alarm"},
+                    {"device": "D2", "signal": "alarm"}]
+        comp = {op: children, "window_ms": 30000, "hold_ms": 500,
+                "reset": {"device": "P1", "signal": "reset"}}
+        if k is not None:
+            comp["k"] = k
+        return comp
+
+    def test_all_confirmed(self):
+        p = composite_payload(composite=self._rule("all"), events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("P1", "reset", 90000)])
+        r = evaluate(p)
+        insts = r["scenarios"][0]["instances"]
+        self.assertEqual(r["status"], "pass")
+        self.assertEqual(len(insts), 1)
+        self.assertEqual(insts[0]["trigger_ts"], 2000)  # t0=最晚置位
+        self.assertEqual({m["device"] for m in insts[0]["members"]},
+                         {"D1", "D2"})
+
+    def test_any_confirmed_uses_earliest(self):
+        p = composite_payload(composite=self._rule("any"), events=[
+            cev("D1", "alarm", 2000), cev("D2", "alarm", 1000),
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        self.assertEqual(insts[0]["trigger_ts"], 1000)  # 最早满足者
+        self.assertEqual([m["device"] for m in insts[0]["members"]], ["D2"])
+
+    def test_k_of_n_confirmed(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2500),
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        self.assertEqual(insts[0]["status"], "pass")
+
+    def test_all_single_detector_no_instance(self):
+        # 偶发单烟、窗口在面板复位前闭合：不足以启动，不立案 -> 不算火警
+        p = composite_payload(composite=self._rule("all"), events=[
+            cev("D1", "alarm", 1000), cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(len(sc["instances"]), 0)
+        self.assertEqual(sc["status"], "pass")
+
+    def test_out_of_window_no_instance(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 41000),
+            cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(len(sc["instances"]), 0)
+
+    def test_list_shorthand(self):
+        # 嵌套 ["k_of_n", 2, 叶子...] 简写等价于 {"k_of_n":[...],"k":2}
+        comp = {"all": [["k_of_n", 2,
+                         {"device": "D1", "signal": "alarm"},
+                         {"device": "D2", "signal": "alarm"}]],
+                "window_ms": 30000, "hold_ms": 500,
+                "reset": {"device": "P1", "signal": "reset"}}
+        p = composite_payload(composite=comp, events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("P1", "reset", 90000)])
+        self.assertEqual(evaluate(p)["status"], "pass")
+        root = evaluate(p)["scenarios"][0]["composite"]["root"]
+        self.assertIn("all", root)
+        self.assertEqual(root["all"][0]["k"], 2)
+
+
+class CompositeRoundTest(unittest.TestCase):
+    """复位前后分轮、重复置位去抖、窗口滑动不串案。"""
+
+    EV_TWO_ROUNDS = [
+        cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+        cev("P1", "reset", 5000),
+        cev("D1", "alarm", 20000, 2), cev("D2", "alarm", 21000, 2),
+        cev("P1", "reset", 90000)]
+
+    def test_reset_splits_rounds(self):
+        p = composite_payload(events=self.EV_TWO_ROUNDS)
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual([i["trigger_ts"] for i in insts], [2000, 21000])
+        self.assertTrue(all(i["status"] == "pass" for i in insts))
+
+    def test_repeat_set_counts_one_round(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000), cev("D1", "alarm", 1100, 2),
+            cev("D2", "alarm", 2000),
+            cev("D1", "alarm", 3000, 3),   # 同一轮第三次上报
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        rep = {m["device"]: m["repeat_sets"]
+               for m in insts[0]["members"]}
+        self.assertEqual(rep["D1"], 2)
+        self.assertEqual(rep["D2"], 0)
+
+    def test_bounce_discarded(self):
+        comp = {"k_of_n": [
+                    {"device": "D1", "signal": "alarm"},
+                    {"device": "D2", "signal": "alarm",
+                     "reset": "restore"}], "k": 2,
+                "window_ms": 30000, "hold_ms": 500,
+                "reset": {"device": "P1", "signal": "reset"}}
+        p = composite_payload(composite=comp, events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("D2", "restore", 2200, 2),       # 200ms 抖动
+            cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(len(sc["instances"]), 0)
+
+    def test_bounce_then_real_alarm(self):
+        comp = {"k_of_n": [
+                    {"device": "D1", "signal": "alarm"},
+                    {"device": "D2", "signal": "alarm",
+                     "reset": "restore"}], "k": 2,
+                "window_ms": 30000, "hold_ms": 500,
+                "reset": {"device": "P1", "signal": "reset"}}
+        p = composite_payload(composite=comp, events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("D2", "restore", 2200, 2),
+            cev("D2", "alarm", 3000, 3),            # 抖动后再真报
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        d2 = next(m for m in insts[0]["members"] if m["device"] == "D2")
+        self.assertEqual(d2["seq"], 3)
+
+    def test_response_chain_bound_to_round(self):
+        p = composite_payload(
+            respond=[{"device": "V1", "signal": "open",
+                      "within_ms": 30000}],
+            events=self.EV_TWO_ROUNDS[:5] + [
+                cev("V1", "open", 3000),
+                cev("P1", "reset", 90000)])
+        # 重排：第一轮 V1 到位，第二轮无 V1 -> 第二轮 timeout
+        p["events"] = [
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("V1", "open", 3000), cev("P1", "reset", 5000),
+            cev("D1", "alarm", 20000, 2), cev("D2", "alarm", 21000, 2),
+            cev("P1", "reset", 90000)]
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual([i["trigger_ts"] for i in insts], [2000, 21000])
+        self.assertEqual(insts[0]["findings"][0]["status"], "ok")
+        self.assertEqual(insts[1]["findings"][0]["status"], "fail")
+        self.assertEqual(insts[1]["findings"][0]["type"], "timeout")
+        self.assertEqual(evaluate(p)["status"], "fail")
+
+
+class CompositeGapTest(unittest.TestCase):
+    """参与设备日志缺号 -> 相关实例 unknown 并列出缺口；不得汇总成空 pass。"""
+
+    def test_missing_seq_marks_unknown_with_gap(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000),
+            cev("D2", "run", 500),
+            {"device": "D2", "seq": 3, "signal": "alarm",
+             "device_ts": 2000},                      # D2 缺 seq=2
+            cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(sc["status"], "unknown")
+        # 同一个缺口只立一个实例（窗口滑动不得重复计数）
+        self.assertEqual(len(sc["instances"]), 1)
+        inst = sc["instances"][0]
+        self.assertEqual(inst["status"], "unknown")
+        self.assertTrue(any(g["member"] == "D2:alarm"
+                            and g["reason"] == "log_gap"
+                            for g in inst["gaps"]))
+
+    def test_gap_might_hide_member_is_unknown(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000),
+            cev("D2", "run", 1500),
+            {"device": "D2", "seq": 3, "signal": "run",
+             "device_ts": 40000},                     # 缺口跨确认窗口
+            cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(sc["status"], "unknown")
+        self.assertEqual(len(sc["instances"]), 1)
+        self.assertTrue(any(g["reason"] == "log_gap"
+                            for g in sc["instances"][0]["gaps"]))
+
+    def test_gap_instance_keeps_responses_unknown(self):
+        p = composite_payload(
+            respond=[{"device": "V1", "signal": "open",
+                      "within_ms": 30000}],
+            events=[
+            cev("D1", "alarm", 1000),
+            cev("D2", "run", 500),
+            {"device": "D2", "seq": 3, "signal": "alarm",
+             "device_ts": 2000},
+            cev("P1", "reset", 90000)])
+        r = evaluate(p)
+        self.assertEqual(r["status"], "unknown")      # 不得因 V1 而变 fail/pass
+        inst = r["scenarios"][0]["instances"][0]
+        self.assertEqual(inst["findings"][0]["status"], "unknown")
+        self.assertEqual(inst["findings"][0]["reason"],
+                         "trigger_not_confirmed")
+
+    def test_gap_before_members_set_is_unknown(self):
+        # 置位事件之前的 seq 缺口可能藏更早报警：组合虽凑齐仍 unknown
+        p = composite_payload(events=[
+            cev("D1", "run", 100),
+            {"device": "D1", "seq": 3, "signal": "alarm",
+             "device_ts": 1000},                       # D1 缺 seq=2
+            cev("D2", "alarm", 2000),
+            cev("P1", "reset", 90000)])
+        sc = evaluate(p)["scenarios"][0]
+        self.assertEqual(sc["status"], "unknown")
+        self.assertEqual(len(sc["instances"]), 1)
+        self.assertTrue(any(g["member"] == "D1:alarm"
+                            for g in sc["instances"][0]["gaps"]))
+
+    def test_gap_round_then_clean_round(self):
+        # 第一轮证据有缺口(unknown)，复位后第二轮日志干净 -> 仍应分出第二轮
+        p = composite_payload(events=[
+            cev("D1", "run", 100),
+            {"device": "D1", "seq": 3, "signal": "alarm",
+             "device_ts": 1000},
+            cev("D2", "alarm", 2000), cev("P1", "reset", 5000),
+            cev("D1", "alarm", 20000, 4),
+            cev("D2", "alarm", 21000, 2),
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        statuses = [(i["trigger_ts"], i["status"]) for i in insts]
+        self.assertIn((2000, "unknown"), statuses)
+        self.assertIn((21000, "pass"), statuses)
+
+    def test_untrusted_member_clock_unknown(self):
+        p = composite_payload(events=[cev("D1", "alarm", 1000)])
+        p["sync_pulses"] = [
+            {"device": "D1", "device_ts": 0, "master_ts": 0},
+            {"device": "D1", "device_ts": 100000, "master_ts": 100500},
+            {"device": "D2", "device_ts": 0, "master_ts": 0},
+            {"device": "M1", "device_ts": 0, "master_ts": 0},
+            {"device": "P1", "device_ts": 0, "master_ts": 0},
+            {"device": "V1", "device_ts": 0, "master_ts": 0}]
+        r = evaluate(p)
+        sc = r["scenarios"][0]
+        self.assertEqual(sc["status"], "unknown")
+        self.assertTrue(any(
+            g["reason"] == "clock_residual_out_of_bounds"
+            for i in sc["instances"] for g in i["gaps"]))
+
+
+class CompositeManualTest(unittest.TestCase):
+    """手报旁路可直接触发；窗口外不抢探测组合。"""
+
+    def test_manual_directly_confirms(self):
+        p = composite_payload(events=[
+            cev("M1", "alarm", 1500), cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        self.assertEqual(insts[0]["kind"], "manual")
+        self.assertEqual(insts[0]["trigger_ts"], 1500)
+
+    def test_manual_with_log_gap_unknown(self):
+        p = composite_payload(events=[
+            cev("M1", "run", 100),
+            {"device": "M1", "seq": 3, "signal": "alarm",
+             "device_ts": 1500},                      # 手报前缺 seq=2
+            cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        self.assertEqual(len(insts), 1)
+        self.assertEqual(insts[0]["kind"], "manual")
+        self.assertEqual(insts[0]["status"], "unknown")
+        self.assertTrue(any(g["reason"] == "log_gap"
+                            for g in insts[0]["gaps"]))
+
+    def test_manual_and_composite_in_same_window(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000), cev("M1", "alarm", 1500),
+            cev("D2", "alarm", 2000), cev("P1", "reset", 90000)])
+        insts = evaluate(p)["scenarios"][0]["instances"]
+        # 同轮：手报先直接确认，只立一个实例
+        self.assertEqual([i["kind"] for i in insts], ["manual"])
+
+
+class CompositeStructureTest(unittest.TestCase):
+    """结构非法 / 循环 / 别名多解 / k 越界 -> unknown 并列缺口。"""
+
+    def _comp(self, root, **extra):
+        c = dict(root)
+        c.update(window_ms=30000, hold_ms=500,
+                 reset={"device": "P1", "signal": "reset"})
+        c.update(extra)
+        return c
+
+    def test_cycle_unknown(self):
+        comp = self._comp(
+            {"all": ["#a"],
+             "defs": {"a": {"any": ["#b"]},
+                      "b": {"all": ["#a"]}}})
+        p = composite_payload(composite=comp)
+        inst = evaluate(p)["scenarios"][0]["instances"][0]
+        self.assertEqual(inst["status"], "unknown")
+        self.assertTrue(any(g["reason"] == "composite_cycle"
+                            for g in inst["gaps"]))
+
+    def test_alias_ambiguous_unknown(self):
+        comp = self._comp({"all": [
+            {"device": "烟感", "signal": "alarm"},
+            {"device": "D2", "signal": "alarm"}]})
+        p = composite_payload(composite=comp, aliases={"烟感": ["D1", "D2"]})
+        inst = evaluate(p)["scenarios"][0]["instances"][0]
+        self.assertEqual(inst["status"], "unknown")
+        self.assertTrue(any(g["reason"] == "alias_ambiguous"
+                            for g in inst["gaps"]))
+
+    def test_k_out_of_range_unknown(self):
+        comp = self._comp({"k_of_n": [
+            {"device": "D1", "signal": "alarm"},
+            {"device": "D2", "signal": "alarm"}], "k": 3})
+        p = composite_payload(composite=comp)
+        inst = evaluate(p)["scenarios"][0]["instances"][0]
+        self.assertEqual(inst["status"], "unknown")
+        self.assertTrue(any(g["reason"] == "k_out_of_range"
+                            for g in inst["gaps"]))
+
+    def test_normalized_rule_pinned_in_replay(self):
+        p = composite_payload(events=[
+            cev("D1", "alarm", 1000), cev("D2", "alarm", 2000),
+            cev("P1", "reset", 90000)])
+        comp = evaluate(p)["scenarios"][0]["composite"]
+        self.assertEqual(comp["window_ms"], 30000)
+        self.assertEqual(comp["reset"], "P1:reset")
+        self.assertEqual(comp["manual"], "M1:alarm")
+        self.assertEqual(comp["root"]["k"], 2)
+        self.assertEqual(
+            sorted((n["device"], n["signal"]) for n in comp["root"]["k_of_n"]),
+            [("D1", "alarm"), ("D2", "alarm")])
+
+
+class LegacySingleTriggerCompatTest(unittest.TestCase):
+    """旧单 trigger 请求在复合引擎上线后行为不变。"""
+
+    def test_single_trigger_still_works(self):
+        p = base_payload(
+            matrix=[{"id": "S",
+                     "trigger": {"device": "TD", "signal": "alarm"},
+                     "respond": [{"device": "R1", "signal": "open",
+                                  "within_ms": 30000}]}],
+            events=[{"device": "TD", "seq": 1, "signal": "alarm",
+                     "device_ts": 1000},
+                    {"device": "R1", "seq": 1, "signal": "open",
+                     "device_ts": 2000}])
+        r = evaluate(p)
+        sc = r["scenarios"][0]
+        self.assertNotIn("composite", sc)       # 旧形态不带 composite
+        self.assertEqual(len(sc["instances"]), 1)
+        self.assertEqual(sc["instances"][0]["status"], "pass")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
