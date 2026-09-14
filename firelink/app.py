@@ -145,9 +145,14 @@ def evaluate(p):
         for dep in resp.get("after", []):
             dd, ds = dep.split(":", 1)
             rd, rerr = resolve(dd)
-            deps = [] if (rerr or rd is None) else [
-                e for e in by_dev.get(rd, [])
-                if e["signal"] == ds and t0 <= e["ts"] <= ev["ts"]]
+            if rerr:  # 前置别名多解/无解：前置状态不明，保持未知而非倒序
+                return {**base, "status": "unknown",
+                        "reason": f"predecessor_{rerr}", "predecessor": dep}
+            if rd in untrusted:  # 前置设备时标不可信，无法判定先后
+                return {**base, "status": "unknown",
+                        "reason": "predecessor_clock_untrusted", "predecessor": dep}
+            deps = [e for e in by_dev.get(rd, [])
+                    if e["signal"] == ds and t0 <= e["ts"] <= ev["ts"]]
             if not deps:
                 return {**base, "status": "fail", "type": "out_of_order",
                         "actual": ev["ts"], "missing_predecessor": dep}
@@ -174,11 +179,22 @@ def evaluate(p):
             t0 = tev["ts"]
             findings = []
             if tdev in untrusted:
+                # 触发设备校时残差越界：t0 不可信，下游环节全部保持未知，
+                # 不再用其时间计算 timeout / out_of_order
                 findings.append({"type": "precondition_unknown", "status": "unknown",
                                  "reason": "clock_residual_out_of_bounds",
                                  "upstream": [trig["device"]]})
-            for resp in rule.get("respond", []):
-                findings.append(check_resp(t0, resp, rule))
+                for resp in rule.get("respond", []):
+                    name, sig = resp["device"], resp["signal"]
+                    chain = ([trig["device"]] + list(resp.get("after", []))
+                             + [f"{name}:{sig}"])
+                    findings.append({"type": "response",
+                                     "target": f"{name}:{sig}", "upstream": chain,
+                                     "status": "unknown",
+                                     "reason": "trigger_clock_untrusted"})
+            else:
+                for resp in rule.get("respond", []):
+                    findings.append(check_resp(t0, resp, rule))
             timeouts = [f for f in findings if f.get("type") == "timeout"]
             if timeouts:  # 首个超时 = 截止时限最早者
                 min(timeouts, key=lambda f: f["deadline"])["first"] = True
@@ -204,7 +220,8 @@ def evaluate(p):
             rd, rerr = resolve(dd)
             if rerr:
                 mutex_findings.append({"group": members, "status": "unknown",
-                                       "reason": rerr, "member": m})
+                                       "reason": rerr, "member": m,
+                                       "upstream": [m]})
                 continue
             for e in by_dev.get(rd, []):
                 if e["signal"] == ds:
@@ -218,6 +235,7 @@ def evaluate(p):
                 if ons[i][0] != ons[j][0]:
                     viol = {"group": members, "status": "fail", "type": "mutex",
                             "members": [ons[i][0], ons[j][0]],
+                            "upstream": [ons[i][0], ons[j][0]],
                             "at": [ons[i][1], ons[j][1]]}
                     break
             if viol:
@@ -225,7 +243,8 @@ def evaluate(p):
         if viol:
             mutex_findings.append(viol)
 
-    # ---- 旁路：许可窗口内且复位为合法；未复位/越窗为失败 ----
+    # ---- 旁路：许可窗口内且复位为合法；未复位/越窗为失败；
+    #      日志缺号可能遗漏 bypass_off 时保持未知 ----
     bypass_findings = []
     permits = p.get("bypass_permits", []) or []
     for d, lst in by_dev.items():
@@ -239,11 +258,22 @@ def evaluate(p):
                 bypass_findings.append({
                     "device": d, "on": on["ts"], "off": e["ts"],
                     "status": "ok" if ok else "fail",
-                    "type": None if ok else "bypass_outside_permit"})
+                    "type": None if ok else "bypass_outside_permit",
+                    "upstream": [f"{d}:bypass_on", f"{d}:bypass_off"]})
                 on = None
         if on:
-            bypass_findings.append({"device": d, "on": on["ts"], "off": None,
-                                    "status": "fail", "type": "bypass_not_reset"})
+            hidden = [g for g in gaps.get(d, []) if g["to_ts"] >= on["ts"]]
+            if hidden:  # 缺号区间可能藏着 bypass_off，不得直接判未复位
+                bypass_findings.append({
+                    "device": d, "on": on["ts"], "off": None,
+                    "status": "unknown", "type": None,
+                    "reason": "log_gap", "gap": hidden[0],
+                    "upstream": [f"{d}:bypass_on"]})
+            else:
+                bypass_findings.append({
+                    "device": d, "on": on["ts"], "off": None,
+                    "status": "fail", "type": "bypass_not_reset",
+                    "upstream": [f"{d}:bypass_on"]})
 
     overall = ("fail" if (any(s["status"] == "fail" for s in scenarios)
                           or any(f["status"] == "fail" for f in mutex_findings + bypass_findings))

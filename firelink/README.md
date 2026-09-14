@@ -51,7 +51,17 @@ python3 simulate.py            # 模拟请求：时钟漂移 / 漏事件 / 合�
 ```
 
 - 时间统一为毫秒；`device_ts + 设备偏移 = 统一时轴`，偏移取该设备校时脉冲的中位数
-- `after` 声明次序约束（阀门到位后才允许风机启动），违反记 `out_of_order`
+- `after` 声明次序约束（阀门到位后才允许风机启动）；前置事件缺失记 `out_of_order`，
+  但前置别名多解/无解或前置时钟不可信时保持 `unknown`，不判倒序
+- 触发设备校时残差越界时，其时刻不可信，下游环节全部 `unknown`，不再计算超时
 - 旁路以 `bypass_on` / `bypass_off` 事件表达；落在许可窗口内且已复位为合法，
-  未复位记 `bypass_not_reset`，越窗记 `bypass_outside_permit`
+  越窗记 `bypass_outside_permit`；无配对复位且日志无缺号才记 `bypass_not_reset`，
+  缺号区间可能遗漏 `bypass_off` 时保持 `unknown`
+- 所有 finding（含 mutex / bypass）均带 `upstream` 上游链路
 - 判定：`pass` / `fail` / `unknown`；任何环节证据不足只标 `unknown`，不臆断
+
+## 测试
+
+```bash
+python3 test_regression.py   # 16 项：边界组合 + 既有行为 + 修订/签结生命周期
+```
