@@ -779,7 +779,9 @@ class ResponseEvidenceTest(unittest.TestCase):
         self.assertEqual(f["evidence"]["sources"][0]["status"], "contradict")
         d = f["evidence"]["divergence"]
         self.assertEqual(d["from_ts"], 2200)
-        self.assertEqual(d["to_ts"], 7000)
+        # 4000->7000 间隔超缺测容限(2000)：分歧区间只在已观测段内，
+        # 不得跨断档或外推到窗口末端（旧实现错误给 7000）
+        self.assertEqual(d["to_ts"], 4000)
         self.assertEqual(r["status"], "fail")
 
     def test_healthy_current_passes_with_samples(self):
@@ -1008,13 +1010,80 @@ class ResponseEvidenceTest(unittest.TestCase):
         insts = r["scenarios"][0]["instances"]
         self.assertEqual([i["trigger_ts"] for i in insts], [1000, 20000])
         f1, f2 = (i["findings"][0] for i in insts)
-        # 第一轮窗口在 3000 截断：2200 一个在范围样本，下一条同信号记录
-        # 在 21500（间隔远超缺测容限）-> 采样断档 unknown，不把下一轮样本
-        # 拿来给本轮作证；第二轮样本齐 -> ok
+        # 第一轮窗口在 3000 截断：2200 一个在范围样本，覆盖到复位仅 800ms
+        # < duration，证据不足 unknown；下一轮 21500 的样本位于 cap 之后，
+        # 不得越过实例边界拿来给本轮算断档/作证；第二轮样本齐 -> ok
         self.assertEqual(f1["status"], "unknown")
         self.assertEqual(f1["evidence"]["sources"][0]["reason"],
-                         "evidence_sample_gap")
+                         "evidence_insufficient")
         self.assertEqual(f2["status"], "ok")
+
+    def test_single_out_of_range_sample_not_extrapolated_to_fail(self):
+        # 反例一(a)：单个越界样本无法覆盖要求的持续时间 -> unknown，
+        # 不得把越界状态外推到窗口末端判 fail（触点只报了一次 0A，
+        # 其后电流可能已正常建立）。
+        ev = cur_evidence(duration_ms=2000, missing_ms=3000)
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 0.0, "A")], ev))   # 仅一条越界样本
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["reason"], "evidence_inconclusive")
+        self.assertEqual(f["evidence"]["status"], "unknown")
+        self.assertNotEqual(f.get("evidence_type"), "evidence_contradiction")
+        src = f["evidence"]["sources"][0]
+        self.assertEqual(src["status"], "unknown")
+        self.assertEqual(src["reason"], "evidence_window_open")
+        self.assertIsNone(f["evidence"].get("divergence"))
+        self.assertEqual(r["status"], "unknown")
+
+    def test_sample_gap_not_extrapolated_to_fail(self):
+        # 反例一(b)：样本间隔超过 missing_ms，即便每个越界样本都在范围外，
+        # 缺口里可能藏在范围样本 -> unknown，不得跨断档外推判 fail。
+        ev = cur_evidence(duration_ms=500, missing_ms=1000)
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 0.0, "A"),
+            smp("I1", "I", 4000, 2, 0.0, "A")], ev))  # 间隔 1500 > 容限
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        src = f["evidence"]["sources"][0]
+        self.assertEqual(src["reason"], "evidence_sample_gap")
+        self.assertEqual(src["gap_segment_ms"], [2500, 4000])
+        self.assertNotEqual(f.get("evidence_type"), "evidence_contradiction")
+        self.assertEqual(r["status"], "unknown")
+
+    def test_post_reset_feedback_not_bound_to_old_round(self):
+        # 反例二：反馈（respond 未声明 within_ms）在全局复位之后才到，
+        # 不得挂到旧触发实例；应只属于复位后的下一轮。
+        devs = {"D1": {"type": "smoke"}, "P9": {"type": "panel"},
+                "F1": {"type": "fan"}, "I1": {"type": "ammeter"}}
+        comp = {"all": [{"device": "D1", "signal": "alarm"}],
+                "window_ms": 30000, "hold_ms": 0,
+                "reset": {"device": "P9", "signal": "reset"}}
+        # 不给 within_ms：旧实现只按触发时限取反馈，复位后的 start 会被
+        # 误挂到第一轮；修复后第一轮应 timeout（复位前无反馈）。
+        resp = {"device": "F1", "signal": "start",
+                "evidence": cur_evidence(window_ms=8000)}
+        p = {
+            "devices": devs, "aliases": {},
+            "matrix": [{"id": "C", "composite": comp, "respond": [resp]}],
+            "sync_pulses": [{"device": d, "device_ts": 0, "master_ts": 0}
+                            for d in devs],
+            "events": [
+                cev("D1", "alarm", 1000),
+                cev("P9", "reset", 5000),            # 第一轮结束
+                cev("F1", "start", 21000, 1),        # 复位后的反馈
+                cev("D1", "alarm", 20000, 2),
+                smp("I1", "I", 21500, 1, 8.0, "A"),
+                smp("I1", "I", 23000, 2, 8.0, "A")]}
+        r = evaluate(p)
+        insts = r["scenarios"][0]["instances"]
+        self.assertEqual([i["trigger_ts"] for i in insts], [1000, 20000])
+        f1, f2 = (i["findings"][0] for i in insts)
+        self.assertEqual(f1["status"], "fail")
+        self.assertEqual(f1["type"], "timeout")
+        self.assertNotIn("evidence", f1)
+        self.assertEqual(f2["status"], "ok")
+        self.assertEqual(f2["actual"], 21000)
 
 
 class LegacySingleTriggerCompatTest(unittest.TestCase):
