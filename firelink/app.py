@@ -447,11 +447,22 @@ def evaluate(p):
                 if nxt is not None or cap is not None:
                     tail_seg = [fb_ts, nxt["ts"] if nxt is not None else hi]
 
-            # ---- 按缺测容限把窗口内样本切成连续观测段；越界/在范围状态
-            #      只能在段内沿用，跨断档不得外推。段内连续同态样本划分为
-            #      run，run 的可证覆盖时长算到：下一个异态样本（异态前一直
-            #      同态）、或闭合窗口末端（仅当空段不超容限的插值）；敞开
-            #      窗口只认已观测时长，绝不外推到窗口末端。----
+            # ---- 缺测优先：起点空段、内部断档、末端断档任一成立即 unknown，
+            #      不得先按越界/在范围下结论。缺口里可能藏反证：单个越界
+            #      样本不能借末端插值满足 duration；越界段虽观测满 duration，
+            #      但其后到下一条记录的间隔超容限同样不能先判 fail。----
+            gap_seg = internal_seg or lead_seg or tail_seg
+            if gap_seg is not None:
+                ent["adopted_samples"] = samples
+                ent["reason"] = "evidence_sample_gap"
+                ent["gap_segment_ms"] = gap_seg
+                return ent
+
+            # ---- 无断档：按缺测容限把窗口内样本切成连续观测段；越界/在
+            #      范围状态只能在段内沿用，跨断档不得外推。段内连续同态样本
+            #      划分为 run，run 的可证覆盖时长算到：下一个异态样本（异态
+            #      前一直同态）、或闭合窗口末端（能走到这里说明末端空段未超
+            #      容限，允许插值）；敞开窗口只认已观测时长，绝不外推。----
             segments, cur = [], []
             for sm in samples:
                 if cur and too_long(cur[-1]["ts"], sm["ts"]):
@@ -479,15 +490,15 @@ def evaluate(p):
                 return out
 
             def covered_span(seg, run):
-                """run 可证覆盖：到段内异态样本，或闭合窗口末端（容限内
-                插值）；敞开窗口 / 断档之后不外推，只认已观测时长。"""
+                """run 可证覆盖：到段内异态样本，或闭合窗口末端（缺测已在
+                上面拦过，此处插值安全）；敞开窗口只认已观测时长。"""
                 flip = next((sm["ts"] for sm in seg
                              if sm["ts"] > run["end"]
                              and sm["in_range"] != run["samples"][0]["in_range"]),
                             None)
                 if flip is not None:
                     return flip - run["start"], flip
-                if not window_open and not too_long(run["end"], hi):
+                if not window_open:
                     return hi - run["start"], hi
                 return run["end"] - run["start"], run["end"]
 
@@ -506,8 +517,8 @@ def evaluate(p):
                             break
 
             ent["adopted_samples"] = samples
-            # 相斥只需一段已观测越界覆盖达到 duration，不依赖任何外推；
-            # 其后的缺测不能洗清已坐实的“信号到了、设备没动”区间。
+            # 相斥只需一段已观测（或闭合窗口容限内）越界覆盖达到 duration，
+            # 不依赖任何跨断档或向敞开末端的外推。
             if contradiction is not None:
                 run, end_bound = contradiction
                 ent["status"] = "contradict"
@@ -520,13 +531,7 @@ def evaluate(p):
             if support_run is not None:
                 ent["status"] = "support"
                 return ent
-            # 覆盖不足时，任何缺测都保持 unknown，不得折算成 fail
-            for seg0 in (internal_seg, lead_seg, tail_seg):
-                if seg0 is not None:
-                    ent["reason"] = "evidence_sample_gap"
-                    ent["gap_segment_ms"] = seg0
-                    return ent
-            # 无缺证可指：闭合窗口证据不足；敞开窗口后续可能补来样本
+            # 无缺证可指但覆盖不够：闭合窗口证据不足；敞开窗口后续可补样本
             ent["reason"] = ("evidence_window_open" if window_open
                              else "evidence_insufficient")
             return ent

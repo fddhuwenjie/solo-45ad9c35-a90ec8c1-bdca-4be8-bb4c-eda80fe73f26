@@ -766,11 +766,12 @@ class ResponseEvidenceTest(unittest.TestCase):
     """响应佐证：离散反馈须与电流/风压/阀位等模拟量证据一致。"""
 
     def test_stuck_contact_zero_current_fails(self):
-        # 触点粘连：start 已上报但电流始终 0A -> fail，给分歧区间
+        # 触点粘连：start 已上报且电流密集持续 0A（无断档）-> fail，分歧
+        # 区间止于最后一个实测越界样本，不外推到敞开窗口末端
         r = evaluate(evidence_payload(FB_EVENTS + [
             smp("I1", "I", 2200, 1, 0.1, "A"),
-            smp("I1", "I", 4000, 2, 0.0, "A"),
-            smp("I1", "I", 7000, 3, 0.0, "A")], cur_evidence()))
+            smp("I1", "I", 3500, 2, 0.0, "A"),
+            smp("I1", "I", 4800, 3, 0.0, "A")], cur_evidence()))
         f = evidence_finding(r)
         self.assertEqual(f["status"], "fail")
         self.assertEqual(f["type"], "response")
@@ -779,10 +780,59 @@ class ResponseEvidenceTest(unittest.TestCase):
         self.assertEqual(f["evidence"]["sources"][0]["status"], "contradict")
         d = f["evidence"]["divergence"]
         self.assertEqual(d["from_ts"], 2200)
-        # 4000->7000 间隔超缺测容限(2000)：分歧区间只在已观测段内，
-        # 不得跨断档或外推到窗口末端（旧实现错误给 7000）
-        self.assertEqual(d["to_ts"], 4000)
+        # 敞开窗口：分歧止于最后一个实测越界样本 4800，不外推到窗口末端 7000
+        self.assertEqual(d["to_ts"], 4800)
         self.assertEqual(r["status"], "fail")
+
+    def test_closed_window_single_sample_not_extrapolated_to_cap(self):
+        # 闭合窗口在 4000 复位：只有 2200 一条 0A 样本，观测覆盖为 0，
+        # 且末样本到复位点 1800ms 超过缺测容限 1500ms -> unknown，
+        # 不得把该单点越界外推到复位点来满足 1500ms duration 判 fail。
+        devs = {"D1": {"type": "smoke"}, "P9": {"type": "panel"},
+                "F1": {"type": "fan"}, "I1": {"type": "ammeter"}}
+        comp = {"all": [{"device": "D1", "signal": "alarm"}],
+                "window_ms": 30000, "hold_ms": 0,
+                "reset": {"device": "P9", "signal": "reset"}}
+        ev = cur_evidence(window_ms=9000, duration_ms=1500, missing_ms=1500)
+        p = {
+            "devices": devs, "aliases": {},
+            "matrix": [{"id": "C", "composite": comp,
+                        "respond": [{"device": "F1", "signal": "start",
+                                     "within_ms": 60000, "evidence": ev}]}],
+            "sync_pulses": [{"device": d, "device_ts": 0, "master_ts": 0}
+                            for d in devs],
+            "events": [
+                cev("D1", "alarm", 1000), cev("F1", "start", 2000),
+                smp("I1", "I", 2200, 1, 0.0, "A"),
+                cev("P9", "reset", 4000)]}
+        r = evaluate(p)
+        f = r["scenarios"][0]["instances"][0]["findings"][0]
+        self.assertEqual(f["status"], "unknown")
+        self.assertNotEqual(f.get("evidence_type"), "evidence_contradiction")
+        src = f["evidence"]["sources"][0]
+        self.assertEqual(src["status"], "unknown")
+        self.assertEqual(src["reason"], "evidence_sample_gap")
+        self.assertEqual(src["gap_segment_ms"], [2200, 4000])
+        self.assertIsNone(f["evidence"].get("divergence"))
+
+    def test_internal_gap_takes_precedence_over_fail(self):
+        # 2200、3200 两条 0A 刚好覆盖 1000ms duration，但到 4800 下一条
+        # 样本间隔 1600ms > 缺测容限 1000ms -> 因内部断档 unknown，
+        # 缺口可能藏在范围样本，不得先按越界判 fail。
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 0.0, "A"),
+            smp("I1", "I", 3200, 2, 0.0, "A"),
+            smp("I1", "I", 4800, 3, 0.0, "A")],
+            cur_evidence(duration_ms=1000, missing_ms=1000)))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertNotEqual(f.get("evidence_type"), "evidence_contradiction")
+        src = f["evidence"]["sources"][0]
+        self.assertEqual(src["status"], "unknown")
+        self.assertEqual(src["reason"], "evidence_sample_gap")
+        self.assertEqual(src["gap_segment_ms"], [3200, 4800])
+        self.assertIsNone(f["evidence"].get("divergence"))
+        self.assertEqual(r["status"], "unknown")
 
     def test_healthy_current_passes_with_samples(self):
         r = evaluate(evidence_payload(FB_EVENTS + [
