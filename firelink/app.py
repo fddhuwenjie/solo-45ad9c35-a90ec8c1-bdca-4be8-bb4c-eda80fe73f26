@@ -17,6 +17,12 @@
   * 别名多解、参与设备日志缺号、校时不可信、组合引用循环或确认窗口证据
     不完整（窗口敞开/缺口可能藏事件）时，该实例保持 unknown 并在 gaps
     中逐项列出缺口。
+- 恢复顺序校核（recovery）：火警解除后把 报警解除 clear、值班员复位 reset、
+  设备回位 steps、锁存确认 ack 绑定回原触发实例；核对排烟阀/风机/电梯/广播
+  的回位次序与最长返回时间；多分区并发时公共设备须等全部占用实例解除。
+  * 设备提前回位 / 恢复超时 / 前置实例仍有效 / 同一确认多轮复用 -> fail；
+    解除日志缺号 / 复位来源不明 / 校时不可信 / 窗口敞开 -> unknown。
+  * 规则中不含 recovery 段的旧请求演算结果完全不变。
 - 日志缺号 / 别名多解 / 校时残差越界 / 前置状态不明 -> 相应环节保持 unknown。
 - 重绑设备或改时钟锚点、改触发规则必须附 justification，系统另起修订并
   保留旧演算（重放 JSON 固定当时的归一化复合规则、组成事件与实例判定）。
@@ -954,6 +960,926 @@ def evaluate(p):
                  else "unknown" if any(i["status"] == "unknown" for i in instances)
                  else "pass")
         scenarios.append({"id": rule.get("id"), "status": sc_st, "instances": instances})
+
+
+    # ---- 恢复顺序校核（火警解除 -> 人工复位 -> 设备回位 -> 锁存确认）----
+    # 仅对声明了 recovery 段的规则生效；未声明 recovery 的旧请求演算结果不变。
+    # 每个触发实例独立绑定一条恢复链：解除条件 clear、复位来源 reset、设备
+    # 回位 steps、最长返回时间 max_return_ms 与锁存确认 ack 都挂回原实例；
+    # 多分区并发时公共设备要等占用它的全部实例解除后方可回位。
+    matrix_rules = p.get("matrix", []) or []
+
+    def ev_ref(ev):
+        return ({"device": ev["device"], "seq": ev.get("seq"),
+                 "signal": ev["signal"], "ts": ev["ts"]}
+                if ev is not None else None)
+
+    def find_events(dev, sig, lo=None, hi=None, before_next=None):
+        """窗口内同信号事件；before_next 为下一轮触发时刻（恢复窗口上界）。"""
+        out = []
+        for e in by_dev.get(dev, []):
+            if e["signal"] != sig:
+                continue
+            if lo is not None and e["ts"] < lo:
+                continue
+            if hi is not None and e["ts"] > hi:
+                continue
+            if before_next is not None and e["ts"] >= before_next:
+                continue
+            out.append(e)
+        return sorted(out, key=lambda e: (e["ts"], e["seq"]))
+
+    def gap_overlaps(dev, lo, hi=None, before_next=None):
+        upper = before_next if before_next is not None else hi
+        for g in gaps.get(dev, []):
+            if g["to_ts"] < lo:
+                continue
+            if upper is not None and g["from_ts"] > upper:
+                continue
+            return g
+        return None
+
+    def seq_gap_between(dev, from_seq, to_seq):
+        """按 seq 次序：from_seq 与 to_seq 之间存在缺号即返回缺口。
+        解除/复位阶段的时间戳可能晚于下一轮触发，但绑定仍按本设备 seq
+        先后判断（时间戳倒序不影响 seq 次序）。"""
+        if from_seq is None or to_seq is None:
+            return None
+        return next((g for g in gaps.get(dev, [])
+                     if g["from_seq"] > from_seq and g["to_seq"] < to_seq),
+                    None)
+
+    def seq_gap_after(dev, from_seq, after_next=False):
+        """from_seq 之后是否存在缺号（可能藏解除/复位/回位事件）。"""
+        if from_seq is None:
+            return None
+        return next((g for g in gaps.get(dev, [])
+                     if g["from_seq"] > from_seq), None)
+
+    def ep_value_ok(ep, ev):
+        """复位来源/解除来源可限定 value（按键号/来源码核对），不限定即全收。"""
+        return ep.get("value") is None or ev.get("value") == ep.get("value")
+
+    def parse_ep(spec, tag):
+        if isinstance(spec, str):
+            ds = spec.split(":", 1)
+            if len(ds) != 2:
+                return None, [{"member": f"{tag}:{spec}",
+                               "reason": "invalid_recovery_endpoint"}]
+            spec = {"device": ds[0], "signal": ds[1]}
+        if not isinstance(spec, dict) or not spec.get("signal") \
+                or not spec.get("device"):
+            return None, [{"member": tag,
+                           "reason": "invalid_recovery_endpoint"}]
+        d, err = resolve(spec.get("device"))
+        if err:
+            return None, [{"member": f"{tag}:{spec['device']}", "reason": err}]
+        return {"device": d, "signal": spec["signal"],
+                "value": spec.get("value")}, None
+
+    def parse_recovery(rule):
+        """归一化 recovery 段；结构非法 -> ({'invalid': [...]}, None)。"""
+        rec = rule.get("recovery")
+        if not rec:
+            return None, None
+        bad = []
+
+        def parse_eps(spec, tag):
+            items = spec if isinstance(spec, list) else [spec]
+            if not items:
+                bad.append({"member": tag,
+                            "reason": "invalid_recovery_endpoint"})
+                return []
+            eps = []
+            for i, c in enumerate(items):
+                ep, ge = parse_ep(c, f"{tag}[{i}]")
+                if ge:
+                    bad += ge
+                else:
+                    eps.append(ep)
+            return eps
+
+        clear_eps = parse_eps(rec.get("clear"), "clear") \
+            if rec.get("clear") is not None else []
+        if rec.get("clear") is None:
+            bad.append({"member": "clear",
+                        "reason": "invalid_recovery_endpoint"})
+        reset_ep, ge = parse_ep(rec["reset"], "reset") if rec.get("reset") \
+            else (None, [{"member": "reset",
+                          "reason": "invalid_recovery_endpoint"}])
+        if ge:
+            bad += ge
+        ack_ep = None
+        if rec.get("ack"):
+            ack_ep, ae = parse_ep(rec["ack"], "ack")
+            if ae:
+                bad += ae
+        try:
+            mr = rec.get("max_return_ms")
+            max_return = int(mr) if mr is not None else None
+            if max_return is not None and max_return < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            bad.append({"member": "max_return_ms",
+                        "reason": "invalid_recovery_endpoint"})
+            max_return = None
+        steps, tokens = [], set()
+        for st0 in rec.get("steps", []) or []:
+            if not isinstance(st0, dict) or not st0.get("device") \
+                    or not st0.get("signal"):
+                bad.append({"member": "steps",
+                            "reason": "invalid_recovery_endpoint"})
+                continue
+            ep, ge = parse_ep(st0, "steps")
+            if ge:
+                bad += ge
+                continue
+            tok = f"{ep['device']}:{ep['signal']}"
+            if tok in tokens:
+                bad.append({"member": f"steps:{tok}",
+                            "reason": "duplicate_recovery_step"})
+                continue
+            tokens.add(tok)
+            try:
+                w0 = st0.get("within_ms")
+                within = int(w0) if w0 is not None else None
+                if within is not None and within < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                bad.append({"member": f"steps:{tok}",
+                            "reason": "invalid_recovery_endpoint",
+                            "detail": {"within_ms": w0}})
+                within = None
+            after = []
+            for dep in st0.get("after", []) or []:
+                if not isinstance(dep, str) or ":" not in dep:
+                    bad.append({"member": f"steps:{tok}",
+                                "reason": "invalid_recovery_after",
+                                "detail": dep})
+                    continue
+                dd = dep.split(":", 1)[0]
+                rd, rerr = resolve(dd)
+                if rerr:
+                    bad.append({"member": f"steps:{tok}",
+                                "reason": f"predecessor_{rerr}",
+                                "detail": dep})
+                elif rd in untrusted:
+                    bad.append({"member": f"steps:{tok}",
+                                "reason": "predecessor_clock_untrusted",
+                                "detail": dep})
+                else:
+                    after.append(dep)
+            steps.append({"device": ep["device"], "signal": ep["signal"],
+                          "token": tok, "within_ms": within, "after": after,
+                          "shared": bool(st0.get("shared"))})
+        if not steps:
+            bad.append({"member": "steps",
+                        "reason": "invalid_recovery_endpoint"})
+        # after 前置必须指向已声明回位步（同规则内），且不得成环
+        for st1 in steps:
+            for dep in st1["after"]:
+                if not any(s["token"] == dep for s in steps):
+                    bad.append({"member": f"steps:{st1['token']}",
+                                "reason": "predecessor_not_a_step",
+                                "detail": dep})
+        graph = {s["token"]: list(s["after"]) for s in steps}
+        for start in graph:
+            stack, seen = [(start, [])], set()
+            while stack:
+                node, path = stack.pop()
+                if node == start and path:
+                    bad.append({"member": f"steps:{start}",
+                                "reason": "recovery_after_cycle"})
+                    break
+                if node in seen:
+                    continue
+                seen.add(node)
+                for nx in graph.get(node, []):
+                    stack.append((nx, path + [node]))
+        shared_devices = set()
+        for sd0 in rec.get("shared_devices", []) or []:
+            d, err = resolve(sd0)
+            if err:
+                bad.append({"member": f"shared:{sd0}", "reason": err})
+            else:
+                shared_devices.add(d)
+        if bad:
+            return {"invalid": bad}, None
+        latch = bool(rec.get("latch", True)) if ack_ep else \
+            bool(rec.get("latch", False))
+        return {"clear": clear_eps, "reset": reset_ep, "ack": ack_ep,
+                "max_return_ms": max_return, "steps": steps,
+                "shared_devices": sorted(shared_devices),
+                "latch": latch}, True
+
+    rec_plan = [parse_recovery(rule) for rule in matrix_rules]
+
+    def trigger_dev_of(rule):
+        """定位实例原始触发事件用：旧单触发的设备/信号。"""
+        tr = rule.get("trigger")
+        if not tr:
+            return None, None
+        d, _ = resolve(tr.get("device"))
+        return d, tr.get("signal")
+
+    rule_trigger = [trigger_dev_of(rule) for rule in matrix_rules]
+
+    # 公共设备：显式声明，或被两条及以上规则联动（respond）的设备。
+    activated_devs = []
+    for rule in matrix_rules:
+        ds = set()
+        for resp in rule.get("respond", []) or []:
+            d, _ = resolve(resp.get("device"))
+            if d:
+                ds.add(d)
+        activated_devs.append(ds)
+    shared_global = set()
+    for spec, valid in rec_plan:
+        if valid:
+            shared_global.update(spec["shared_devices"])
+    for d in {d for ds in activated_devs for d in ds}:
+        if sum(d in ds for ds in activated_devs) >= 2:
+            shared_global.add(d)
+
+    def anchor_event(idx, inst):
+        """实例的原始定位事件：复合用组成叶子，旧触发用原始报警事件。"""
+        for m in inst.get("members", []) or []:
+            if m.get("seq") is not None:
+                return {"device": m["device"], "seq": m["seq"],
+                        "signal": m["signal"], "ts": m["set_ts"]}
+        td, tsig = rule_trigger[idx]
+        if td and tsig is not None and inst.get("trigger_ts") is not None:
+            hit = next((e for e in by_dev.get(td, [])
+                        if e["signal"] == tsig
+                        and e["ts"] == inst["trigger_ts"]), None)
+            if hit:
+                return ev_ref(hit)
+        return None
+
+
+
+    # ---- 逐实例求解恢复链 ----
+    def trigger_anchor_seq(idx, inst):
+        """本实例在各触发/组成设备上的起始 seq（用于按 seq 找缺口）。"""
+        out = {}
+        for m in inst.get("members", []) or []:
+            if m.get("seq") is not None:
+                out.setdefault(m["device"], m["seq"])
+        if not out:
+            td, tsig = rule_trigger[idx]
+            if td and inst.get("trigger_ts") is not None:
+                hit = next((e for e in by_dev.get(td, [])
+                            if e["signal"] == tsig
+                            and e["ts"] == inst["trigger_ts"]), None)
+                if hit:
+                    out[td] = hit.get("seq")
+        return out
+
+    def solve_instance(idx, inst, next_ts):
+        spec, _ = rec_plan[idx]
+        t0 = inst.get("trigger_ts")
+        tail_open = next_ts is None
+        st = {"spec": spec, "inst": inst, "trigger_ts": t0,
+              "confirmed": t0 is not None and inst.get("status") != "unknown",
+              "clear": [], "reset": None, "ack": None, "steps": [],
+              "pre_fail": None, "pre_unknown": None,
+              "blocked": [], "unknown_occupants": []}
+        if t0 is None:
+            st["pre_unknown"] = "trigger_not_confirmed"
+            return st
+        anchor_seq = trigger_anchor_seq(idx, inst)
+
+        def last_before(dev, hard_next):
+            return max((e.get("seq") for e in by_dev.get(dev, [])
+                        if e.get("seq") is not None
+                        and (hard_next is None or e["ts"] < hard_next)),
+                       default=None)
+
+        def bind(dev, sig, lo_ts, lo_seq, want_value=None, hard_next=None):
+            """在统一时轴 lo_ts 之后绑定本实例动作：
+            * lo_seq：本设备上“已绑定给本实例（或其前序）的最后一个事件”
+              的 seq；其后到候选（或窗口末尾）之间的 seq 缺口可能藏事件
+              -> unknown，不臆断。
+            * hard_next：下一轮触发时刻，其后的事件属下一轮，不得回扫。
+            返回 (event, code, why, gap)，code ∈ ok/fail/unknown。"""
+            if dev in untrusted:
+                return None, "unknown", "clock_residual_out_of_bounds", None
+            raw = find_events(dev, sig, lo=lo_ts)
+            cands = ([e for e in raw if hard_next is None
+                      or e["ts"] < hard_next])
+            good = [e for e in cands
+                    if want_value is None or e.get("value") == want_value]
+            chosen = good[0] if good else None
+            end_seq = (chosen.get("seq") if chosen
+                       else last_before(dev, hard_next))
+            g = None
+            if lo_seq is not None and end_seq is not None:
+                g = seq_gap_between(dev, lo_seq, end_seq)
+            if chosen is None and lo_seq is not None and hard_next is None:
+                g = g or seq_gap_after(dev, lo_seq)
+            if chosen is not None and g:
+                return chosen, "unknown", "log_gap", g
+            if chosen is not None:
+                return chosen, "ok", None, None
+            if g:
+                return None, "unknown", "log_gap", g
+            if not tail_open or hard_next is not None:
+                return None, "fail", "missing", None
+            return None, "unknown", "recovery_window_open", None
+
+        # 阶段 1：报警解除（clear 各端点均须观察到）
+        clear_ts = t0
+        for ep in spec["clear"]:
+            d, tok = ep["device"], f"{ep['device']}:{ep['signal']}"
+            ev0, code, why, g = bind(d, ep["signal"], t0,
+                                     anchor_seq.get(d),
+                                     want_value=ep.get("value"),
+                                     hard_next=next_ts)
+            ent = {"endpoint": tok, "status": "unknown",
+                   "actual": None, "seq": None}
+            if code == "ok":
+                ent.update(status="ok", actual=ev0["ts"],
+                           seq=ev0.get("seq"), event=ev_ref(ev0))
+                clear_ts = max(clear_ts, ev0["ts"])
+                st["clear"].append(ent)
+                continue
+            if ev0 is not None and ep.get("value") is not None:
+                ent.update(reason="clear_source_unknown",
+                           event=ev_ref(ev0))
+            else:
+                ent["reason"] = why
+                if g:
+                    ent["gap"] = g
+            st["clear"].append(ent)
+            st["pre_fail" if code == "fail" else "pre_unknown"] = \
+                "clear_missing" if code == "fail" else "clear_not_observed"
+        if st["pre_unknown"] or st["pre_fail"]:
+            return st
+
+        # 阶段 2：值班员复位（复位来源须可核对，且应晚于全部解除；
+        # 面板复位走跨实例申领，多分区并发的同刻复位可共用一条）
+        rep = spec["reset"]
+        ev0, code, why, g = claim_event(
+            rep["device"], rep["signal"], clear_ts,
+            hard_next=next_ts, want_value=rep.get("value"),
+            lo_seq0=anchor_seq.get(rep["device"]))
+        if ev0 is not None and rep.get("value") is not None \
+                and ev0.get("value") != rep.get("value"):
+            code, why = "unknown", "reset_source_unknown"
+        rent = {"endpoint": f"{rep['device']}:{rep['signal']}",
+                "status": "unknown", "actual": None, "seq": None}
+        if code == "ok":
+            rent.update(status="ok", actual=ev0["ts"], seq=ev0.get("seq"),
+                        event=ev_ref(ev0))
+            st["reset"] = rent
+        elif ev0 is not None and rep.get("value") is not None:
+            rent.update(reason="reset_source_unknown", event=ev_ref(ev0))
+            st["reset"], st["pre_unknown"] = rent, "reset_source_unknown"
+            return st
+        else:
+            rent["reason"] = ("reset_missing" if code == "fail" else why)
+            if g:
+                rent["gap"] = g
+            st["reset"] = rent
+            if code == "fail":
+                st["pre_fail"] = "reset_source_unknown"
+            else:
+                st["pre_unknown"] = "reset_source_unknown"
+            return st
+        reset_ts, reset_seq = rent["actual"], rent["seq"]
+
+        # 阶段 3：锁存确认（申领确认事件并绑定本实例；同一确认事件被
+        # 多轮复用在汇总阶段判 fail）
+        if spec["ack"]:
+            aep = spec["ack"]
+            ev0, code, why, g = claim_event(
+                aep["device"], aep["signal"], reset_ts,
+                hard_next=next_ts, want_value=aep.get("value"),
+                lo_seq0=reset_seq)
+            aent = {"endpoint": f"{aep['device']}:{aep['signal']}",
+                    "status": "unknown", "actual": None, "seq": None}
+            if code == "ok":
+                aent.update(status="ok", actual=ev0["ts"],
+                            seq=ev0.get("seq"), event=ev_ref(ev0))
+                st["ack"] = aent
+            else:
+                aent["reason"] = ("ack_missing" if code == "fail" else why)
+                if g:
+                    aent["gap"] = g
+                st["ack"] = aent
+                if code == "fail":
+                    st["pre_fail"] = "ack_missing"
+                else:
+                    st["pre_unknown"] = "ack_not_observed"
+                return st
+
+        # 阶段 4：设备回位（提前回位 / 时限 / 回位次序）
+        prev_seq = dict(anchor_seq)          # 每台设备已绑定最后 seq
+        prev_seq[rep["device"]] = reset_seq
+        last_ts_on = {rep["device"]: reset_ts}
+        for sp in spec["steps"]:
+            d, tok = sp["device"], sp["token"]
+            is_shared = d in shared_global
+            # 公共设备的回位上界不取本规则下一轮触发，而取跨规则下一次
+            # 占用它的触发（多分区并发时，本分区复位后设备仍在为他区运行）。
+            if is_shared:
+                occ_triggers = []
+                for oi, orule in enumerate(matrix_rules):
+                    if d not in activated_devs[oi]:
+                        continue
+                    for oi2 in scenarios[oi]["instances"]:
+                        tt = oi2.get("trigger_ts")
+                        if tt is not None and tt > t0:
+                            occ_triggers.append(tt)
+                step_next = min(occ_triggers, default=None)
+            else:
+                step_next = next_ts
+            chain = ["clear", rent["endpoint"]] + list(sp["after"]) + [tok]
+            f = {"type": "recovery_step", "target": tok,
+                 "upstream": chain, "status": "unknown",
+                 "shared": is_shared}
+            # 前置回位步：必须是已绑定、按时回位的事件
+            lo_step, dep_bad = reset_ts, None
+            for dep in sp["after"]:
+                prior = next((x for x in st["steps"]
+                              if x.get("target") == dep), None)
+                pactual = prior.get("actual") if prior else None
+                if pactual is None:
+                    if prior is not None and prior["status"] == "unknown":
+                        dep_bad = ("unknown",
+                                   prior.get("reason")
+                                   or "predecessor_not_returned", dep)
+                    else:
+                        dep_bad = ("fail",
+                                   (prior or {}).get("reason")
+                                   or "predecessor_not_returned", dep)
+                    break
+                if prior["status"] == "fail":
+                    dep_bad = ("fail",
+                               prior.get("reason")
+                               or "predecessor_not_returned", dep)
+                    break
+                lo_step = max(lo_step, pactual)
+            within = (sp["within_ms"] if sp["within_ms"] is not None
+                      else spec["max_return_ms"])
+            deadline = reset_ts + within if within is not None else None
+            # 提前回位（非公共设备）：触发后、复位之前窗口内已回位
+            early_list, early_gap = [], None
+            if not is_shared:
+                early_list = find_events(d, sp["signal"], lo=t0,
+                                         hi=reset_ts,
+                                         before_next=next_ts)
+                if not early_list:
+                    end_seq0 = last_before(d, next_ts)
+                    gg = (seq_gap_between(d, anchor_seq.get(d), end_seq0)
+                          if anchor_seq.get(d) is not None
+                          and end_seq0 is not None
+                          else seq_gap_after(d, anchor_seq.get(d)))
+                    if gg and gg["from_ts"] <= reset_ts:
+                        early_gap = gg
+            if dep_bad:
+                f.update(status=dep_bad[0], reason=dep_bad[1],
+                         predecessor=dep_bad[2])
+                st["steps"].append(f)
+                continue
+            if early_list:
+                ev0 = early_list[0]
+                f.update(status="fail", reason="returned_before_reset",
+                         type="recovery_early_return", actual=ev0["ts"],
+                         event=ev_ref(ev0))
+                st["steps"].append(f)
+                continue
+            if early_gap:
+                f.update(reason="log_gap", gap=early_gap)
+                st["steps"].append(f)
+                continue
+            # 回位绑定：从“本实例可回位时刻”（复位与全部前置都完成）起取
+            # 第一条回位；先 fan 后 valve 的次序也不会拿后一轮回位冒充。
+            # 公共设备走跨实例申领：同一物理回位可被多个并发占用分区共用，
+            # 之后的分区申领下一条；提前/占用是否合法在占用核查阶段判定。
+            shared_status = None
+            if is_shared:
+                ev0, shared_status, why0, g0 = claim_event(
+                    d, sp["signal"], lo_step, shared=True)
+                window_evs = [ev0] if ev0 else []
+            else:
+                # 非公共设备仍从复位时刻起取，以捕捉“先于前置回位”的倒序
+                window_evs = [] if d in untrusted else [
+                    e for e in find_events(d, sp["signal"], lo=reset_ts)
+                    if step_next is None or e["ts"] < step_next]
+                ev0, g0 = window_evs[0] if window_evs else None, None
+            if ev0 is not None:
+                if not is_shared:
+                    gg = (seq_gap_between(d, prev_seq.get(d), ev0.get("seq"))
+                          if prev_seq.get(d) is not None
+                          and ev0.get("seq") is not None else None)
+                else:
+                    gg = g0 if shared_status == "unknown" else None
+                if gg:
+                    f.update(reason="log_gap", gap=gg)
+                elif not is_shared and ev0["ts"] < lo_step:
+                    # 非公共设备回位早于应先回位的前置：前置仍有效 -> 倒序
+                    f.update(status="fail",
+                             reason="predecessor_still_active",
+                             type="recovery_out_of_order",
+                             predecessor=(sp["after"][0]
+                                          if sp["after"] else None),
+                             actual=ev0["ts"], seq=ev0.get("seq"),
+                             event=ev_ref(ev0))
+                elif deadline is not None and ev0["ts"] > deadline:
+                    f.update(status="fail", type="recovery_timeout",
+                             reason="recovery_timeout", deadline=deadline,
+                             actual=ev0["ts"], seq=ev0.get("seq"),
+                             over_ms=ev0["ts"] - deadline,
+                             event=ev_ref(ev0))
+                else:
+                    f.update(status="ok", actual=ev0["ts"],
+                             seq=ev0.get("seq"),
+                             elapsed_ms=ev0["ts"] - reset_ts,
+                             event=ev_ref(ev0))
+            else:
+                if is_shared and shared_status == "unknown":
+                    f.update(reason=why0, gap=g0)
+                elif is_shared and shared_status == "fail":
+                    if deadline is not None:
+                        f.update(status="fail", type="recovery_timeout",
+                                 reason="recovery_timeout",
+                                 deadline=deadline)
+                    else:
+                        f.update(status="fail",
+                                 reason="step_not_returned")
+                else:
+                    end_floor = last_before(d, step_next)
+                    gg = (seq_gap_between(d, prev_seq.get(d), end_floor)
+                          if prev_seq.get(d) is not None and end_floor is not None
+                          else seq_gap_after(d, prev_seq.get(d))
+                          if prev_seq.get(d) is not None else None)
+                    if gg:
+                        f.update(reason="log_gap", gap=gg)
+                    elif step_next is not None or not tail_open:
+                        late = find_events(d, sp["signal"], lo=lo_step,
+                                           before_next=step_next)
+                        if late and deadline is not None:
+                            e2 = late[0]
+                            f.update(status="fail", type="recovery_timeout",
+                                     reason="recovery_timeout",
+                                     deadline=deadline, actual=e2["ts"],
+                                     seq=e2.get("seq"),
+                                     over_ms=e2["ts"] - deadline,
+                                     event=ev_ref(e2))
+                        elif deadline is not None:
+                            f.update(status="fail", type="recovery_timeout",
+                                     reason="recovery_timeout",
+                                     deadline=deadline)
+                        else:
+                            f.update(status="fail",
+                                     reason="step_not_returned")
+                    else:
+                        f["reason"] = "recovery_window_open"
+            st["steps"].append(f)
+            if f.get("actual") is not None:
+                prev_seq[d] = f.get("seq")
+                last_ts_on[d] = f["actual"]
+        return st
+    rec_states = [None] * len(matrix_rules)
+    # 公共设备回位事件的跨实例申领：同一回位动作可同时释放多个并发占用
+    # 分区（同刻共用）；其后的实例从下一条回位申领。按全局触发时刻交错
+    # 求解，使申领顺序与占用发生顺序一致。
+    shared_claims = {}   # (dev,sig) -> list of claimed events
+
+    def claim_event(dev, sig, lo_ts, shared=False, hard_next=None,
+                    want_value=None, lo_seq0=None):
+        """取本实例在 lo_ts 之后的动作。
+        * shared=True（公共设备回位）：跨实例申领，同一物理回位动作可同时
+          释放多个并发占用分区（同刻共用），其后的实例从下一条回位继续。
+        * 面板复位/锁存确认等非共享信号：每实例独立取事件，不占全局名额。
+        返回 (event, code, why, gap)，code ∈ ok/fail/unknown。"""
+        if dev in untrusted:
+            return None, "unknown", "clock_residual_out_of_bounds", None
+        if shared:
+            key = (dev, sig)
+            used = shared_claims.setdefault(key, [])
+        else:
+            used = []
+        used_keys = {(u["ts"], u.get("seq")) for u in used}
+        pool = sorted((e for e in by_dev.get(dev, [])
+                       if e["signal"] == sig and e["ts"] >= lo_ts
+                       and (hard_next is None or e["ts"] < hard_next)
+                       and (want_value is None
+                            or e.get("value") == want_value)),
+                      key=lambda e: (e["ts"], e["seq"]))
+        cands = []
+        for e in pool:
+            # 同刻事件允许并发占用实例共用；否则已申领事件不得再取
+            if (e["ts"], e.get("seq")) in used_keys and \
+                    not any(u["ts"] == e["ts"] for u in used):
+                continue
+            cands.append(e)
+        ev0 = cands[0] if cands else None
+        lo_seq = lo_seq0
+        if shared and lo_seq is None:
+            lo_seq = max((u.get("seq") for u in used
+                          if u.get("seq") is not None), default=None)
+        if ev0 is not None:
+            g = (seq_gap_between(dev, lo_seq, ev0.get("seq"))
+                 if lo_seq is not None and ev0.get("seq") is not None
+                 else None)
+            if g:
+                return ev0, "unknown", "log_gap", g
+            if shared:
+                used.append(ev0)
+            return ev0, "ok", None, None
+        # 无候选：本轮窗口内的末尾 seq（hard_next 之前），其后缺号可能藏事件
+        if hard_next is not None:
+            last_seq = max((e.get("seq") for e in by_dev.get(dev, [])
+                            if e.get("seq") is not None
+                            and e["ts"] < hard_next), default=None)
+        else:
+            last_seq = max((e.get("seq") for e in by_dev.get(dev, [])
+                            if e.get("seq") is not None), default=None)
+        g = (seq_gap_between(dev, lo_seq, last_seq)
+             if lo_seq is not None and last_seq is not None
+             else seq_gap_after(dev, lo_seq)
+             if lo_seq is not None else None)
+        if g:
+            return None, "unknown", "log_gap", g
+        return None, "fail", "missing", None
+
+    def claim_shared(dev, sig, lo_ts):
+        return claim_event(dev, sig, lo_ts, shared=True)
+
+    def release_claim(dev, sig, ev0):
+        """回退一次申领（事件早于本实例可用时刻 -> 让给并发的更早实例）。"""
+        used = shared_claims.get((dev, sig))
+        if not used:
+            return
+        for k in range(len(used) - 1, -1, -1):
+            if used[k] is ev0:
+                del used[k]
+                return
+
+    # ---- 求解所有实例（无效规则直接登记；有效规则按全局触发时刻交错，
+    #      使公共设备申领顺序与占用发生顺序一致）----
+    solve_order = sorted(((i["trigger_ts"], idx, j)
+                          for idx, sc in enumerate(scenarios)
+                          for j, i in enumerate(sc["instances"])
+                          if i["trigger_ts"] is not None))
+    for idx, (rule0, sc0) in enumerate(zip(matrix_rules, scenarios)):
+        spec, valid = rec_plan[idx]
+        if valid:
+            continue
+        rec_states[idx] = (None if spec is None
+                           else [{"invalid": spec["invalid"], "inst": i}
+                                 for i in sc0["instances"]]
+                           or [{"invalid": spec["invalid"], "inst": None}])
+    for _, idx, j in solve_order:
+        spec, valid = rec_plan[idx]
+        if not valid:
+            continue
+        sc = scenarios[idx]
+        tlist = sorted(i["trigger_ts"] for i in sc["instances"]
+                       if i["trigger_ts"] is not None)
+        inst = sc["instances"][j]
+        nxt = next((t for t in tlist if t > inst["trigger_ts"]), None)
+        if rec_states[idx] is None:
+            rec_states[idx] = []
+        rec_states[idx].append(solve_instance(idx, inst, nxt))
+    for idx, sc in enumerate(scenarios):
+        spec, valid = rec_plan[idx]
+        if not valid or rec_states[idx] is None:
+            continue
+        have = {id(s.get("inst")) for s in rec_states[idx]}
+        tlist = sorted(i["trigger_ts"] for i in sc["instances"]
+                       if i["trigger_ts"] is not None)
+        for inst in sc["instances"]:
+            if id(inst) in have:
+                continue
+            nxt = next((t for t in tlist if t > (inst["trigger_ts"] or -1)),
+                       None)
+            rec_states[idx].append(solve_instance(idx, inst, nxt))
+
+    # ---- 公共设备占用核查（以回位事件时刻为准）----
+    def occupant_clear(ost):
+        """占用实例的解除时刻：已坐实 clear 给时刻；证据不明给 'unknown'；
+        无 recovery 规则无法核对解除 -> 'unknown'；未解除 -> None。"""
+        if "invalid" in ost:
+            return "unknown"
+        if ost.get("pre_unknown") in ("clear_not_observed",
+                                      "trigger_not_confirmed"):
+            return "unknown"
+        clears = [c for c in ost.get("clear", []) if c.get("actual") is not None]
+        if not clears:
+            return None if ost.get("confirmed") else "unknown"
+        return max(c["actual"] for c in clears)
+
+    all_states = [(ri, st) for ri, sts in enumerate(rec_states)
+                  if sts for st in sts]
+    for idx, states in enumerate(rec_states):
+        if not states:
+            continue
+        spec, valid = rec_plan[idx]
+        if not valid:
+            continue
+        for st in states:
+            if "spec" not in st:
+                continue
+            t0 = st["trigger_ts"]
+            for sp in spec["steps"]:
+                if sp["device"] not in shared_global:
+                    continue
+                sf = next((x for x in st["steps"]
+                           if x["target"] == sp["token"]), None)
+                ret_ts = sf.get("actual") if sf else None
+                if ret_ts is None:
+                    # 回位本身都没成立：占用核查不另立 finding
+                    continue
+                for oidx, ost in all_states:
+                    if oidx == idx and ost is st:
+                        continue
+                    if "spec" not in ost and "invalid" not in ost:
+                        continue   # 非恢复规则实例：无法核对解除，嫌疑另列
+                    # 占用判定：对方规则联动过该公共设备
+                    if sp["device"] not in activated_devs[oidx]:
+                        continue
+                    ot0 = ost.get("trigger_ts")
+                    if ot0 is None or ot0 >= ret_ts:
+                        continue
+                    oc = occupant_clear(ost)
+                    base = {"rule": matrix_rules[oidx].get("id"),
+                            "trigger_ts": ot0,
+                            "step": sp["token"],
+                            "devices": [sp["device"]],
+                            "event": anchor_event(oidx, ost.get("inst"))}
+                    if oc == "unknown":
+                        if not any(b["rule"] == base["rule"]
+                                   and b["trigger_ts"] == ot0
+                                   and b["step"] == sp["token"]
+                                   for b in st["unknown_occupants"]):
+                            st["unknown_occupants"].append(base)
+                    elif oc is None or oc > ret_ts:
+                        if not any(b["rule"] == base["rule"]
+                                   and b["trigger_ts"] == ot0
+                                   and b["step"] == sp["token"]
+                                   for b in st["blocked"]):
+                            st["blocked"].append(base)
+
+    # ---- 锁存确认跨实例复用登记 ----
+    ack_usage = {}
+    for idx, states in enumerate(rec_states):
+        if not states:
+            continue
+        for st in states:
+            if "spec" not in st or not st.get("ack"):
+                continue
+            ev = st["ack"].get("event")
+            if ev:
+                ack_usage.setdefault((ev["device"], ev.get("seq")), []).append(
+                    (idx, st))
+
+    def build_block(st, spec):
+        findings = []
+        if "invalid" in st:
+            for g in st["invalid"]:
+                findings.append({"type": "recovery_precondition",
+                                 "status": "unknown", "reason": g["reason"],
+                                 "endpoint": g.get("member"),
+                                 "detail": g.get("detail"),
+                                 "upstream": ["recovery"]})
+            return {"status": "unknown", "clear": [], "reset": None,
+                    "ack": None, "steps": [], "findings": findings,
+                    "blocked_by": [], "gaps": st["invalid"]}
+        if st.get("pre_fail"):
+            findings.append({"type": "recovery_precondition",
+                             "status": "fail", "reason": st["pre_fail"],
+                             "upstream": ["recovery"]})
+        if st.get("pre_unknown"):
+            findings.append({"type": "recovery_precondition",
+                             "status": "unknown", "reason": st["pre_unknown"],
+                             "upstream": ["recovery"]})
+        for c in st.get("clear", []):
+            if c["status"] == "unknown":
+                f = {"type": "recovery_clear", "target": c["endpoint"],
+                     "status": "unknown", "reason": c["reason"],
+                     "upstream": [c["endpoint"]]}
+                if c.get("gap"):
+                    f["gap"] = c["gap"]
+                findings.append(f)
+        if st.get("reset") and st["reset"]["status"] == "unknown":
+            f = {"type": "recovery_reset", "target": st["reset"]["endpoint"],
+                 "status": "unknown", "reason": st["reset"]["reason"],
+                 "upstream": [st["reset"]["endpoint"]]}
+            if st["reset"].get("gap"):
+                f["gap"] = st["reset"]["gap"]
+            findings.append(f)
+        if st.get("ack") and st["ack"]["status"] == "unknown":
+            f = {"type": "recovery_ack", "target": st["ack"]["endpoint"],
+                 "status": "unknown", "reason": st["ack"]["reason"],
+                 "upstream": [st["ack"]["endpoint"]]}
+            if st["ack"].get("gap"):
+                f["gap"] = st["ack"]["gap"]
+            findings.append(f)
+        findings += [dict(x) for x in st.get("steps", [])]
+        timeouts = [f for f in findings
+                    if f.get("type") == "recovery_timeout"]
+        if timeouts:
+            min(timeouts, key=lambda f: f["deadline"])["first"] = True
+        for b in st.get("blocked", []):
+            findings.append({"type": "shared_occupancy", "status": "fail",
+                             "reason": "shared_equipment_still_occupied",
+                             "rule": b["rule"], "trigger_ts": b["trigger_ts"],
+                             "devices": b["devices"], "event": b["event"],
+                             "upstream": ["recovery",
+                                          f"{b['rule']}@{b['trigger_ts']}"]})
+        for b in st.get("unknown_occupants", []):
+            findings.append({"type": "shared_occupancy", "status": "unknown",
+                             "reason": "occupant_clear_unknown",
+                             "rule": b["rule"], "trigger_ts": b["trigger_ts"],
+                             "devices": b["devices"], "event": b["event"],
+                             "upstream": ["recovery",
+                                          f"{b['rule']}@{b['trigger_ts']}"]})
+        if st.get("ack") and st["ack"].get("event") and spec["latch"]:
+            ev = st["ack"]["event"]
+            users = ack_usage.get((ev["device"], ev.get("seq")), [])
+            if len(users) > 1:
+                others = [{"rule": matrix_rules[ri].get("id"),
+                           "trigger_ts": u["trigger_ts"]}
+                          for ri, u in users if u is not st]
+                findings.append({"type": "recovery_ack", "status": "fail",
+                                 "reason": "ack_reused_across_rounds",
+                                 "target": st["ack"]["endpoint"],
+                                 "event": ev_ref(ev), "reused_by": others,
+                                 "upstream": [st["ack"]["endpoint"]]})
+        status = ("fail" if any(f["status"] == "fail" for f in findings)
+                  else "unknown"
+                  if any(f["status"] == "unknown" for f in findings)
+                  else "ok")
+        return {"status": status,
+                "clear": [c for c in st.get("clear", [])],
+                "reset": st.get("reset"),
+                "ack": ({"endpoint": st["ack"]["endpoint"],
+                         "event": ev_ref(st["ack"]["event"])}
+                        if st.get("ack") and st["ack"].get("event")
+                        else st.get("ack")),
+                "steps": st.get("steps", []),
+                "blocked_by": st.get("blocked", []),
+                "findings": findings}
+
+    def normalize_recovery_out(spec):
+        return {"clear": [f"{e['device']}:{e['signal']}"
+                          + (f"={e['value']}" if e.get("value") is not None
+                             else "") for e in spec["clear"]],
+                "reset": f"{spec['reset']['device']}:{spec['reset']['signal']}"
+                + (f"={spec['reset']['value']}"
+                   if spec["reset"].get("value") is not None else ""),
+                "ack": (f"{spec['ack']['device']}:{spec['ack']['signal']}"
+                        if spec["ack"] else None),
+                "max_return_ms": spec["max_return_ms"],
+                "latch": spec["latch"],
+                "shared_devices": spec["shared_devices"],
+                "steps": [{"device": s["device"], "signal": s["signal"],
+                           "within_ms": s["within_ms"], "after": s["after"],
+                           "shared": s["shared"]} for s in spec["steps"]]}
+
+    # 汇总进场景：每实例挂 recovery 块，重算实例/场景状态；
+    # 归一化恢复规则固定进重放 JSON（旧演算不重算，保持原结果）。
+    for idx, sc in enumerate(scenarios):
+        spec, valid = rec_plan[idx]
+        if not valid and spec is None:
+            continue
+        norm = {"invalid": spec["invalid"]} if not valid \
+            else normalize_recovery_out(spec)
+        states = rec_states[idx]
+        by_id = {id(s.get("inst")): s for s in states if s.get("inst")}
+        new_instances = []
+        for inst in sc["instances"]:
+            st = by_id.get(id(inst))
+            if st is None:
+                new_instances.append(inst)
+                continue
+            block = build_block(st, spec)
+            ni = dict(inst)
+            ni["recovery"] = block
+            ni["findings"] = inst.get("findings", []) + block["findings"]
+            if block["status"] == "fail":
+                ni["status"] = "fail"
+            elif block["status"] == "unknown" and ni["status"] != "fail":
+                ni["status"] = "unknown"
+            new_instances.append(ni)
+        for st in states:
+            if st.get("inst") is None:
+                block = build_block(st, spec)
+                new_instances.append({"trigger_ts": None, "kind": "recovery",
+                                      "status": "unknown", "members": [],
+                                      "gaps": st["invalid"],
+                                      "findings": block["findings"],
+                                      "recovery": block})
+        sc["instances"] = new_instances
+        sc["recovery"] = {"rule": norm}
+        sc["status"] = (
+            "fail" if any(i["status"] == "fail" for i in new_instances)
+            else "unknown" if any(i["status"] == "unknown"
+                                  for i in new_instances)
+            else "pass")
 
     # ---- 互斥输出 ----
     mutex_findings = []
