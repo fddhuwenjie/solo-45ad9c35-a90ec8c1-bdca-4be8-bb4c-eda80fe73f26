@@ -37,6 +37,22 @@
     单位无法换算、采样断档、日志缺号、窗口敞开/证据不足保持 unknown。
   * 未声明 evidence 的旧 respond 演算结果完全不变；归一化佐证规则、采用
     样本与分歧区间固定进重放 JSON，改佐证规则必须附 justification 另起修订。
+- 主备切换复演（failover）：排烟风机、消防泵按主备组配置，主机收到联动
+  命令后跳闸，控制器须在限定时间内转启备用机；主机只是反馈迟到时过早
+  切换会造成双机并行或电源过载。respond 可声明 failover 段：
+  * 矩阵字段：primary（缺省为本响应）、fault（主机故障信号）、standby
+    （备用启动）、switch_wait_ms（故障后须等满的切换等待）、total_ms
+    （总完成时限）、parallel_ms（允许并行时长）、group（共享备用组）。
+  * 分析器把命令、主机运行佐证、故障信号与备用启动绑定到同一触发实例，
+    区分主机成功 primary_success、合法切换 legal_switch、误切换
+    spurious_switch、双机超时并行 parallel_overrun、备用超时
+    standby_timeout；多分区争用同一备用机按触发时刻独占核对占用
+    （先触发先得，后到者记 standby_occupied）。
+  * 故障日志缺号、时钟不可信、主机佐证未决、敞开窗口证据不足或共享备用
+    组备用归属多解时保持 unknown，不臆断；合法切换覆盖主机自身超时/
+    佐证相斥的 fail 判定，选择链与采用事件固定进重放 JSON。
+  * 规则中不含 failover 段的旧请求演算结果完全不变；规则改动派生修订，
+    旧响应保持原判定，diff 给出 failover 规则与结论差异。
 - 日志缺号 / 别名多解 / 校时残差越界 / 前置状态不明 -> 相应环节保持 unknown。
 - 重绑设备或改时钟锚点、改触发规则必须附 justification，系统另起修订并
   保留旧演算（重放 JSON 固定当时的归一化复合规则、组成事件与实例判定）。
@@ -59,7 +75,13 @@
                                    {device, signal, window_ms?,
                                     range:{min,max,unit},      # 同族单位可换算
                                     duration_ms?, missing_ms?},
-                                   "DEV:SIG"]}}]}]}
+                                   "DEV:SIG"]},
+                               # 主备切换复演（可选；不声明则维持原判定）:
+                               failover:{
+                                 primary?: "DEV:SIG",          # 缺省为本响应
+                                 fault: "DEV:SIG", standby: "DEV:SIG",
+                                 switch_wait_ms, total_ms, parallel_ms,
+                                 group?: "共享备用组名"}}]}]}
                     # 复合写法（trigger 旁并列 composite，或仅给 composite）:
                     {id, composite:{
                        all|any|k_of_n: [叶子, ...],
@@ -640,6 +662,138 @@ def evaluate(p):
             elif er["status"] == "unknown":
                 out.update(status="unknown", reason="evidence_inconclusive")
         return out
+
+    # ---------------------------------------------------- 主备切换规则归一化
+    # 排烟风机/消防泵按主备组配置：respond 可声明 failover 段，把主机命令
+    # (primary，缺省为本响应)、主机故障信号 fault、备用启动 standby、切换
+    # 等待 switch_wait_ms、总完成时限 total_ms、允许并行时长 parallel_ms
+    # 与共享备用组 group 绑定到同一触发实例复演。规则改动派生修订，旧响应
+    # 与旧演算保持原判定。
+    _failover_cache = {}
+
+    def parse_fo_endpoint(spec, tag, bad):
+        if isinstance(spec, str):
+            ds = spec.split(":", 1)
+            if len(ds) != 2:
+                bad.append({"member": tag, "reason": "invalid_failover"})
+                return None
+            spec = {"device": ds[0], "signal": ds[1]}
+        if not isinstance(spec, dict) or not spec.get("device") \
+                or not spec.get("signal"):
+            bad.append({"member": tag, "reason": "invalid_failover"})
+            return None
+        d, err = resolve(spec["device"])
+        if err:
+            bad.append({"member": f"{tag}:{spec['device']}", "reason": err})
+            return None
+        return {"device": d, "signal": spec["signal"]}
+
+    def normalize_failover(resp):
+        """归一化 respond.failover；结构非法 -> ({'invalid': [...]}, None)。"""
+        if "failover" not in resp:
+            return None
+        key = id(resp)
+        if key in _failover_cache:
+            return _failover_cache[key]
+
+        def result(norm, valid):
+            _failover_cache[key] = (norm, valid)
+            return _failover_cache[key]
+
+        fo = resp["failover"]
+        if not isinstance(fo, dict):
+            return result({"invalid": [{"member": "failover",
+                                        "reason": "invalid_failover"}]}, None)
+        bad = []
+        ep_fault = parse_fo_endpoint(fo.get("fault"),
+                                     "failover:fault", bad)
+        ep_stand = parse_fo_endpoint(fo.get("standby"),
+                                     "failover:standby", bad)
+        td, terr = resolve(resp.get("device"))
+        if terr:
+            bad.append({"member": "failover:primary", "reason": terr})
+            target_tok = f"{resp.get('device')}:{resp.get('signal')}"
+        else:
+            target_tok = f"{td}:{resp['signal']}"
+        ep_primary = {"device": td, "signal": resp["signal"]} \
+            if not terr else None
+        if fo.get("primary") is not None:
+            ep_explicit = parse_fo_endpoint(fo.get("primary"),
+                                            "failover:primary", bad)
+            if ep_explicit is not None:
+                if f"{ep_explicit['device']}:{ep_explicit['signal']}" \
+                        != target_tok:
+                    bad.append({"member": "failover:primary",
+                                "reason": "failover_primary_mismatch",
+                                "detail": f"{ep_explicit['device']}:"
+                                          f"{ep_explicit['signal']}"})
+                else:
+                    ep_primary = ep_explicit
+
+        def ms_field(name):
+            v = fo.get(name)
+            if isinstance(v, bool) or not isinstance(v, numbers.Real) \
+                    or int(v) < 0:
+                bad.append({"member": f"failover:{name}",
+                            "reason": "invalid_failover",
+                            "detail": {name: v}})
+                return None
+            return int(v)
+
+        wait = ms_field("switch_wait_ms")
+        total = ms_field("total_ms")
+        parallel = ms_field("parallel_ms")
+        group = fo.get("group")
+        if group is not None and (not isinstance(group, str) or not group):
+            bad.append({"member": "failover:group",
+                        "reason": "invalid_failover"})
+            group = None
+        if bad:
+            dedup, seen = [], set()
+            for b in bad:
+                k = (b.get("member"), b.get("reason"))
+                if k not in seen:
+                    seen.add(k)
+                    dedup.append(b)
+            return result({"invalid": dedup}, None)
+        return result({
+            "primary": f"{ep_primary['device']}:{ep_primary['signal']}",
+            "fault": f"{ep_fault['device']}:{ep_fault['signal']}",
+            "standby": f"{ep_stand['device']}:{ep_stand['signal']}",
+            "switch_wait_ms": wait, "total_ms": total,
+            "parallel_ms": parallel, "group": group}, True)
+
+    def failover_plan(rule, group_invalid):
+        """固定本规则各 respond 的归一化主备规则进重放 JSON。
+        group_invalid: 共享备用组跨规则备用归属多解时该组的非法说明。"""
+        out = []
+        for resp in rule.get("respond", []) or []:
+            if "failover" not in resp:
+                continue
+            norm, valid = normalize_failover(resp)
+            if valid and norm.get("group") in group_invalid:
+                norm = {"invalid": group_invalid[norm["group"]]}
+                valid = False
+            target = (norm.get("primary") if valid
+                      else f"{resp.get('device')}:{resp.get('signal')}")
+            out.append({"target": target, "valid": bool(valid),
+                        "rule": norm})
+        return out
+
+    def failover_group_conflicts(rules):
+        """同一共享备用组在不同规则里指向不同备用端点 -> 备用归属多解。"""
+        groups = {}
+        for rule in rules:
+            for resp in rule.get("respond", []) or []:
+                nf = normalize_failover(resp)
+                if not nf or not nf[1] or not nf[0].get("group"):
+                    continue
+                groups.setdefault(nf[0]["group"], set()).add(
+                    nf[0]["standby"])
+        return {g: [{"member": f"failover:group:{g}",
+                     "reason": "standby_group_ambiguous",
+                     "detail": sorted(toks)}]
+                for g, toks in groups.items() if len(toks) > 1}
 
     # ---------------------------------------------------- 复合触发引擎
     # 一个“触发实例”= 一轮火警。确认 = 组合在 window_ms 窗口内凑齐（
@@ -1321,8 +1475,11 @@ def evaluate(p):
         return out
 
     scenarios = []
+    failover_group_invalid = failover_group_conflicts(
+        p.get("matrix", []) or [])
     for rule in p.get("matrix", []) or []:
         plan = evidence_plan(rule)
+        fo_plan = failover_plan(rule, failover_group_invalid)
         if "composite" in rule:
             normalized, raw = eval_composite_rule(rule)
             if raw is None:  # 结构非法（别名多解/循环/k 越界/端点非法）
@@ -1358,6 +1515,8 @@ def evaluate(p):
                     inst = {"trigger_ts": r0["trigger_ts"], "kind": r0["kind"],
                             "status": st0, "members": r0["members"],
                             "gaps": r0["gaps"], "findings": findings}
+                    if fo_plan:
+                        inst["cap"] = r0["cap"]
                     instances.append(inst)
             sc_st = ("fail" if any(i["status"] == "fail" for i in instances)
                      else "unknown"
@@ -1367,6 +1526,8 @@ def evaluate(p):
                       "composite": normalized, "instances": instances}
             if plan:
                 sc_obj["evidence_rules"] = plan
+            if fo_plan:
+                sc_obj["failover_rules"] = fo_plan
             scenarios.append(sc_obj)
             continue
 
@@ -1417,6 +1578,8 @@ def evaluate(p):
         sc_obj = {"id": rule.get("id"), "status": sc_st, "instances": instances}
         if plan:
             sc_obj["evidence_rules"] = plan
+        if fo_plan:
+            sc_obj["failover_rules"] = fo_plan
         scenarios.append(sc_obj)
 
 
@@ -2381,6 +2544,467 @@ def evaluate(p):
                                   for i in new_instances)
             else "pass")
 
+    # ---- 主备切换复演（主机跳闸后限定时间内转启备用机）----
+    # 仅对声明了 failover 段的 respond 生效；未声明的演算结果完全不变。
+    # 把主机命令/运行佐证/故障信号/备用启动绑定到同一触发实例，区分：
+    #   primary_success  主机成功（无需切换）
+    #   legal_switch     故障坐实后等满切换等待再转启，未造成超时长并行
+    #   spurious_switch  故障前启备机（主机只是反馈迟到），误切换
+    #   parallel_overrun 双机并行超过允许并行时长
+    #   standby_timeout  故障坐实但总时限内未启备用（含备用被更早分区占用）
+    # 多分区争用同一备用机按触发时刻核对占用：先触发先得，同一备用启动
+    # 记录只绑定一个触发实例。故障日志缺号、时钟不可信、主机佐证未决、
+    # 备用归属多解 -> 相应链路保持 unknown。
+    def fo_find_primary_finding(inst, target):
+        return next((f for f in inst.get("findings", [])
+                     if f.get("type") == "response"
+                     and f.get("target") == target), None)
+
+    def fo_event_ref(e):
+        return ev_ref(e) if e is not None else None
+
+    def fo_gap(dev, lo, hi):
+        return gap_between(dev, lo, hi)
+
+    def solve_failover(plan_ent, inst, ctx):
+        """逐触发实例复演一条主备链。
+        ctx = {'standby': 申领到的备用启动事件或 None,
+               'holder': 占用该事件的更早实例归属或 None,
+               'busy':   窗口内被更早实例占用的备用事件列表,
+               'closed': 备用窗口是否已闭合（cap 或窗口后有记录）}"""
+        norm = plan_ent["rule"]
+        target = plan_ent["target"]
+        block = {"target": target, "rule": norm, "status": "unknown",
+                 "outcome": None, "findings": []}
+        t0 = inst.get("trigger_ts")
+        cap = inst.get("cap")
+
+        def add(status, ftype, reason, **extra):
+            f = {"type": ftype, "target": target,
+                 "upstream": [target], "status": status, "reason": reason}
+            if norm.get("fault"):
+                f["upstream"] += [norm["fault"], norm["standby"]]
+            f.update(extra)
+            block["findings"].append(f)
+            return f
+
+        def finish(status, outcome=None):
+            block["status"] = status
+            block["outcome"] = outcome
+            return block
+
+        if not plan_ent["valid"]:
+            for g in norm["invalid"]:
+                add("unknown", "failover_precondition", g["reason"],
+                    endpoint=g.get("member"), detail=g.get("detail"))
+            return finish("unknown")
+        wait, total, parallel = (norm["switch_wait_ms"], norm["total_ms"],
+                                 norm["parallel_ms"])
+        pdev, psig = norm["primary"].split(":", 1)
+        fdev, fsig = norm["fault"].split(":", 1)
+        sdev, ssig = norm["standby"].split(":", 1)
+        pf = fo_find_primary_finding(inst, target)
+        deadline = t0 + total if t0 is not None else None
+
+        # ---- 前置：触发未确认 ----
+        if t0 is None:
+            add("unknown", "failover_precondition", "trigger_not_confirmed")
+            return finish("unknown")
+        # ---- 前置：触发时标不可信（旧单触发在实例 findings 里已有标记）----
+        if pf is not None and pf.get("reason") in (
+                "trigger_clock_untrusted",
+                "clock_residual_out_of_bounds"):
+            add("unknown", "failover_precondition",
+                "clock_residual_out_of_bounds")
+            return finish("unknown")
+        # ---- 前置：任一相关设备时标不可信 ----
+        for dd in (pdev, fdev, sdev):
+            if dd in untrusted:
+                add("unknown", "failover_precondition",
+                    "clock_residual_out_of_bounds", endpoint=dd)
+                return finish("unknown")
+        # ---- 主机佐证未决：不臆断主机成败，整条链路 unknown ----
+        if pf is not None and pf.get("status") == "unknown":
+            add("unknown", "failover_primary",
+                pf.get("reason") or "primary_evidence_pending",
+                actual=pf.get("actual"))
+            return finish("unknown")
+
+        def faults(lo, hi):
+            return sorted((e for e in by_dev.get(fdev, [])
+                           if e["signal"] == fsig and lo <= e["ts"]
+                           and (hi is None or e["ts"] <= hi)),
+                          key=lambda e: (e["ts"], e.get("seq") or 0))
+
+        def running_after_switch(s_ts):
+            """复用主机运行佐证的采用样本，判定 s_ts 之后主机是否仍持续
+            运行超过允许并行时长。
+            返回 'overrun' / 'ended' / 'inconclusive' / 'no_evidence'。
+            结论只建立在已观测样本上：敞开窗口不外推，缺口优先由调用方拦。"""
+            if pf is None or "evidence" not in pf:
+                return "no_evidence"
+            evb = pf["evidence"]
+            if evb.get("status") == "contradict":
+                # 佐证相斥自带分歧区间：区间在宽限内结束 = 主机已停
+                div = evb.get("divergence") or {}
+                to = div.get("to_ts")
+                if to is not None and to <= s_ts + parallel:
+                    return "ended"
+                return "inconclusive"
+            src_verdicts = []
+            for src in evb.get("sources", []):
+                post = [sm for sm in src.get("adopted_samples", [])
+                        if sm["ts"] >= s_ts]
+                inr = [sm for sm in post if sm["in_range"]]
+                if not inr:
+                    src_verdicts.append(
+                        "ended" if post else "inconclusive")
+                    continue
+                start = inr[0]["ts"]
+                stop = next((sm["ts"] for sm in post
+                             if sm["ts"] >= start and not sm["in_range"]),
+                            None)
+                if stop is not None:
+                    span = stop - start
+                elif cap is not None:
+                    span = cap - start        # 闭合窗口允许插值到实例边界
+                else:
+                    span = inr[-1]["ts"] - start   # 敞开窗口只认已观测时长
+                src_verdicts.append("overrun" if span > parallel
+                                    else "ended" if stop is not None
+                                    else "inconclusive")
+            if "overrun" in src_verdicts:
+                return "overrun"
+            if src_verdicts and all(v == "ended" for v in src_verdicts):
+                return "ended"
+            return "inconclusive"
+
+        s_ev = ctx["standby"]
+        s_ts = s_ev["ts"] if s_ev is not None else None
+        within_window = (s_ts is not None and s_ts <= deadline
+                         and (cap is None or s_ts < cap))
+
+        # ---- 情形 A：总时限内拿到备用启动 ----
+        if within_window:
+            g_standby = None
+            if s_ev.get("seq") is not None:
+                p_ev = next((e for e in by_dev.get(pdev, [])
+                             if e["signal"] == psig and e["ts"] >= t0
+                             and (cap is None or e["ts"] < cap)
+                             and (pf is None or pf.get("actual") is None
+                                  or e["ts"] == pf["actual"])), None)
+                lo_seq = p_ev.get("seq") if p_ev else None
+                if lo_seq is not None:
+                    g_standby = next((g for g in gaps.get(sdev, [])
+                                      if g["from_seq"] > lo_seq
+                                      and g["to_seq"] < s_ev["seq"]), None)
+            if g_standby:
+                add("unknown", "failover_standby", "log_gap", gap=g_standby,
+                    standby=fo_event_ref(s_ev))
+                return finish("unknown")
+            # 争用：该启动记录已被更早触发的分区独占
+            if ctx.get("holder"):
+                fe = faults(t0, deadline)
+                g = fo_gap(fdev, t0, deadline)
+                if fe and not g:
+                    add("fail", "standby_contention", "standby_occupied",
+                        deadline=deadline, occupied_by=ctx["holder"],
+                        standby=fo_event_ref(s_ev))
+                    return finish("fail", "standby_timeout")
+                if g:
+                    add("unknown", "failover_fault", "log_gap", gap=g)
+                    return finish("unknown")
+                add("fail", "standby_contention", "standby_occupied",
+                    deadline=deadline, occupied_by=ctx["holder"],
+                    standby=fo_event_ref(s_ev))
+                return finish("fail", "standby_timeout")
+            # 故障信号：命令后整个总完成时限内搜索。切换前的故障用于
+            # 判定合法/过早切换；切换后的故障（主机反馈迟到）只能解释
+            # 并行何时结束，不能为切换授权。
+            fe_all = faults(t0, deadline)
+            fe = next((e for e in fe_all if e["ts"] <= s_ts), None)
+            fe_late = None if fe else next(
+                (e for e in fe_all if e["ts"] > s_ts), None)
+            g_fault = fo_gap(fdev, t0, s_ts)
+            if fe is not None and not g_fault:
+                # ---- 切换前故障已坐实 ----
+                if s_ts - fe["ts"] < wait:
+                    add("fail", "failover_switch", "switch_before_wait",
+                        fault=ev_ref(fe), standby=fo_event_ref(s_ev),
+                        switch_wait_ms=wait, elapsed_ms=s_ts - fe["ts"],
+                        deadline=fe["ts"] + wait)
+                    return finish("fail", "spurious_switch")
+                verdict = running_after_switch(fe["ts"])
+                if verdict == "overrun":
+                    add("fail", "failover_parallel", "parallel_overrun",
+                        fault=ev_ref(fe), standby=fo_event_ref(s_ev),
+                        parallel_ms=parallel,
+                        parallel_from=fe["ts"], parallel_to=s_ts)
+                    return finish("fail", "parallel_overrun")
+                if verdict == "inconclusive":
+                    add("unknown", "failover_primary",
+                        "primary_evidence_pending",
+                        fault=ev_ref(fe), standby=fo_event_ref(s_ev))
+                    return finish("unknown")
+                add("ok", "failover_switch", "legal_switch",
+                    fault=ev_ref(fe), standby=fo_event_ref(s_ev),
+                    switch_wait_ms=wait, elapsed_ms=s_ts - fe["ts"],
+                    total_elapsed_ms=s_ts - t0, deadline=deadline)
+                return finish("ok", "legal_switch")
+            # ---- 故障前已启备用：主机只是反馈迟到（误切换）----
+            if g_fault and fe_late is None:
+                add("unknown", "failover_fault", "log_gap", gap=g_fault)
+                return finish("unknown")
+            if g_fault and fe_late is not None:
+                add("unknown", "failover_fault", "log_gap", gap=g_fault)
+                return finish("unknown")
+            if pf is not None and pf.get("actual") is not None \
+                    and pf["actual"] > s_ts:
+                gp = fo_gap(pdev, t0, s_ts + parallel)
+                if gp:
+                    add("unknown", "failover_primary", "log_gap", gap=gp)
+                    return finish("unknown")
+            verdict = running_after_switch(s_ts)
+            # 离散链（无佐证段）：主机反馈迟到时刻可直接量并行时长
+            primary_late = (pf.get("actual") if pf is not None
+                            and pf.get("status") == "ok"
+                            and pf.get("actual") is not None
+                            and pf["actual"] > s_ts else None)
+            overlap_to = fe_late["ts"] if fe_late is not None \
+                else primary_late if primary_late is not None \
+                else s_ts + parallel
+            overrun = False
+            if verdict == "overrun":
+                overrun = True
+            elif fe_late is not None and verdict != "ended" \
+                    and fe_late["ts"] - s_ts > parallel:
+                overrun = True
+            elif verdict == "no_evidence" and fe_late is not None \
+                    and fe_late["ts"] - s_ts > parallel:
+                overrun = True
+            elif verdict == "no_evidence" and primary_late is not None \
+                    and primary_late - s_ts > parallel:
+                overrun = True
+            if overrun:
+                add("fail", "failover_parallel", "parallel_overrun",
+                    standby=fo_event_ref(s_ev),
+                    fault=ev_ref(fe_late) if fe_late else None,
+                    parallel_ms=parallel,
+                    parallel_from=s_ts, parallel_to=overlap_to,
+                    over_ms=overlap_to - s_ts - parallel)
+                return finish("fail", "parallel_overrun")
+            if verdict == "inconclusive":
+                add("unknown", "failover_primary",
+                    "primary_evidence_pending",
+                    standby=fo_event_ref(s_ev))
+                return finish("unknown")
+            if verdict == "no_evidence" and fe_late is None \
+                    and pf is None and cap is None:
+                # 无主机反馈、无故障、敞开窗口：后续可能补来跳闸/反馈，
+                # 不臆断误切换（开关动作已发生，但合法性待证）
+                add("unknown", "failover_fault", "failover_window_open",
+                    standby=fo_event_ref(s_ev), deadline=deadline)
+                return finish("unknown")
+            # 离散链：主机反馈迟到时长决定并行是否超时；无故障即启备机
+            # 本身即误切换，并行未超时记 spurious_switch
+            if verdict == "no_evidence" and fe_late is None \
+                    and pf is not None and pf.get("status") == "ok" \
+                    and cap is None:
+                # 主机反馈已到但无故障：误切换成立；敞开窗口不影响该判定，
+                # 因为故障须在切换前到达才合法，之后补来已无授权意义
+                pass
+            add("fail", "failover_switch", "spurious_switch",
+                standby=fo_event_ref(s_ev),
+                fault=ev_ref(fe_late) if fe_late else None,
+                parallel_ms=parallel,
+                parallel_from=s_ts, parallel_to=overlap_to)
+            return finish("fail", "spurious_switch")
+
+        # ---- 情形 B：总时限内无备用启动 ----
+        fe_list = faults(t0, deadline)
+        g_fault = fo_gap(fdev, t0, deadline)
+        g_standby = fo_gap(sdev, t0, deadline)
+        if g_standby:
+            add("unknown", "failover_standby", "log_gap", gap=g_standby)
+            return finish("unknown")
+        if g_fault:
+            add("unknown", "failover_fault", "log_gap", gap=g_fault)
+            return finish("unknown")
+        # 争用：窗口内备用启动全部被更早触发的实例占用
+        if ctx.get("busy"):
+            who, bev = ctx["busy"][0]
+            add("fail", "standby_contention", "standby_occupied",
+                deadline=deadline, occupied_by=who,
+                standby=fo_event_ref(bev))
+            return finish("fail", "standby_timeout")
+        closed = ctx.get("closed") or cap is not None
+        if fe_list:
+            add("fail", "failover_standby", "standby_timeout",
+                fault=ev_ref(fe_list[0]), deadline=deadline)
+            return finish("fail", "standby_timeout")
+        if not closed:
+            add("unknown", "failover_fault", "failover_window_open",
+                deadline=deadline)
+            return finish("unknown")
+        # 窗口闭合且无故障、无备用启动：主机成功，无需切换（不立 fail）
+        if pf is not None and pf.get("status") == "ok":
+            return finish("ok", "primary_success")
+        if pf is not None and pf.get("status") == "fail":
+            if pf.get("evidence_type") == "evidence_contradiction":
+                # 佐证已坐实主机跳闸却未切换
+                add("fail", "failover_standby", "standby_timeout",
+                    deadline=deadline)
+                return finish("fail", "standby_timeout")
+            add("fail", "failover_primary",
+                pf.get("reason") or "primary_timeout",
+                deadline=deadline, actual=pf.get("actual"))
+            return finish("fail", "primary_failed_no_switch")
+        add("unknown", "failover_primary", "primary_evidence_pending",
+            deadline=deadline)
+        return finish("unknown")
+
+    # 预申领：按全局触发时刻交错，先触发先得（同一备用启动记录只绑一个
+    # 触发实例）；同时记录窗口内被更早实例占用的备用事件与窗口闭合情况。
+    fo_plans = []
+    for idx, rule0 in enumerate(matrix_rules):
+        fo_plans.append({ent["target"]: ent
+                         for ent in scenarios[idx].get("failover_rules", [])})
+    standby_claims = {}        # (dev,sig) -> 已占用事件
+    standby_holders = {}       # (dev,sig,ts,seq) -> 归属引用
+    fo_ctx = {}                # (idx,j,target) -> ctx
+    fo_order = sorted(((i.get("trigger_ts"), idx, j)
+                       for idx, sc in enumerate(scenarios)
+                       for j, i in enumerate(sc["instances"])
+                       if i.get("trigger_ts") is not None))
+    for _, idx, j in fo_order:
+        inst = scenarios[idx]["instances"][j]
+        t0 = inst["trigger_ts"]
+        cap = inst.get("cap")
+        rid = matrix_rules[idx].get("id")
+        for target, ent in fo_plans[idx].items():
+            if not ent["valid"]:
+                fo_ctx[(idx, j, target)] = None
+                continue
+            sdev, ssig = ent["rule"]["standby"].split(":", 1)
+            pdev2 = ent["rule"]["primary"].split(":", 1)[0]
+            fdev2 = ent["rule"]["fault"].split(":", 1)[0]
+            deadline = t0 + ent["rule"]["total_ms"]
+            hi = cap if cap is not None and cap < deadline else deadline
+            used = standby_claims.setdefault((sdev, ssig), [])
+            used_keys = {(u["ts"], u.get("seq")) for u in used}
+            pool = sorted((e for e in by_dev.get(sdev, [])
+                           if e["signal"] == ssig and t0 <= e["ts"] <= hi),
+                          key=lambda e: (e["ts"], e.get("seq") or 0))
+            free = next((e for e in pool
+                         if (e["ts"], e.get("seq")) not in used_keys), None)
+            holder = None
+            if free is None and pool:
+                he = pool[0]
+                holder = standby_holders.get(
+                    (sdev, ssig, he["ts"], he.get("seq")))
+            if free is not None:
+                used.append(free)
+                ref = {"rule": rid, "trigger_ts": t0,
+                       "event": ev_ref(free)}
+                standby_holders[(sdev, ssig, free["ts"],
+                                 free.get("seq"))] = ref
+            busy = []
+            for e in pool:
+                who = standby_holders.get(
+                    (sdev, ssig, e["ts"], e.get("seq")))
+                if who is not None and who["trigger_ts"] < t0:
+                    busy.append((who, e))
+            # 窗口闭合：实例边界截断，或主/故/备任一设备在时限后还有日志
+            # （证明采集已覆盖到窗口之后；敞开窗口不得直接判 fail）
+            closed = cap is not None
+            if not closed:
+                for dd in (sdev, fdev2, pdev2):
+                    if any(e["ts"] > hi for e in by_dev.get(dd, [])):
+                        closed = True
+                        break
+            fo_ctx[(idx, j, target)] = {
+                "standby": free, "holder": holder if free is None else None,
+                "busy": busy, "closed": closed}
+    # trigger_ts=None 的实例（触发未确认/兜底）：规则非法照常登记，
+    # 合法规则只做前置 unknown，不参与备用申领。
+    for idx, sc in enumerate(scenarios):
+        for j, inst in enumerate(sc["instances"]):
+            if inst.get("trigger_ts") is not None:
+                continue
+            for target in fo_plans[idx]:
+                fo_ctx[(idx, j, target)] = {
+                    "standby": None, "holder": None, "busy": [],
+                    "closed": inst.get("cap") is not None}
+
+    fo_blocks = {}
+    for idx, sc in enumerate(scenarios):
+        for j, inst in enumerate(sc["instances"]):
+            for target, ent in fo_plans[idx].items():
+                fo_blocks[(idx, j, target)] = solve_failover(
+                    ent, inst, fo_ctx.get((idx, j, target)))
+
+    # 汇总进场景：每实例挂 failover 块；合法切换覆盖主机超时/佐证相斥的
+    # fail 判定，重算实例/场景状态。归一化规则固定进重放 JSON。
+    for idx, sc in enumerate(scenarios):
+        if not fo_plans[idx]:
+            continue
+        new_instances = []
+        for j, inst in enumerate(sc["instances"]):
+            ni = dict(inst)
+            added = []
+            block_by_target = {}
+            for target in fo_plans[idx]:
+                block = fo_blocks.get((idx, j, target))
+                if block is None:
+                    continue
+                ni.setdefault("failover", []).append(block)
+                added += block["findings"]
+                block_by_target[target] = block
+            merged = list(inst.get("findings", [])) + added
+            superseded, shadowed = set(), set()
+            for target, block in block_by_target.items():
+                pf = next((f for f in merged
+                           if f.get("target") == target
+                           and f.get("status") == "fail"
+                           and (f.get("type") == "timeout"
+                                or f.get("evidence_type")
+                                == "evidence_contradiction")), None)
+                if pf is None:
+                    continue
+                if block["status"] == "ok" \
+                        and block.get("outcome") == "legal_switch":
+                    # 合法切换：主机自身的超时/佐证相斥判定被切换链覆盖
+                    pf["superseded_by"] = "failover"
+                    superseded.add(id(pf))
+                elif block["status"] == "unknown":
+                    # 主备链证据不足（缺号/窗口敞开/佐证未决）：主机超时
+                    # 不再直接拖成 fail，随主备链保持 unknown
+                    pf["shadowed_by"] = "failover"
+                    shadowed.add(id(pf))
+            for f in merged:
+                if f.get("type") == "timeout":
+                    f.pop("first", None)
+            timeouts = [f for f in merged if f.get("type") == "timeout"
+                        and id(f) not in superseded
+                        and id(f) not in shadowed]
+            if timeouts:
+                min(timeouts, key=lambda f: f["deadline"])["first"] = True
+            live = [f for f in merged
+                    if id(f) not in superseded and id(f) not in shadowed]
+            ni["findings"] = merged
+            ni["status"] = (
+                "fail" if any(f.get("status") == "fail" for f in live)
+                else "unknown"
+                if any(f.get("status") == "unknown" for f in live)
+                else "pass")
+            new_instances.append(ni)
+        sc["instances"] = new_instances
+        sc["status"] = (
+            "fail" if any(i["status"] == "fail" for i in new_instances)
+            else "unknown" if any(i["status"] == "unknown"
+                                  for i in new_instances)
+            else "pass")
+
     # ---- 互斥输出 ----
     mutex_findings = []
     for grp in p.get("mutex", []) or []:
@@ -2571,6 +3195,64 @@ def evidence_changes(ra, rb):
     return changes
 
 
+def failover_rule_canonical(rule):
+    """归一化主备规则的稳定投影：非法规则仅留 invalid，合法规则全字段比较。"""
+    if not isinstance(rule, dict):
+        return rule
+    if "invalid" in rule:
+        return {"invalid": rule["invalid"]}
+    return {k: rule.get(k) for k in
+            ("primary", "fault", "standby", "switch_wait_ms", "total_ms",
+             "parallel_ms", "group")}
+
+
+def failover_changes(ra, rb):
+    """对比两版结果中每个 respond 的主备切换复演：规则版本与结论差异。
+    旧版未声明 failover 的 respond 不列出（保持原结果即可）。"""
+    def index(result):
+        out = {}
+        for sc in result.get("scenarios", []):
+            rules = {e["target"]: e for e in sc.get("failover_rules", [])}
+            for inst in sc.get("instances", []):
+                for block in inst.get("failover", []):
+                    plan = rules.get(block["target"])
+                    if plan is None:
+                        plan = {"target": block["target"], "valid": True,
+                                "rule": block.get("rule")}
+                    out[(sc["id"], inst.get("trigger_ts"),
+                         block["target"])] = {
+                        "rule": failover_rule_canonical(plan.get("rule")),
+                        "status": block.get("status"),
+                        "outcome": block.get("outcome")}
+        return out
+    ia, ib = index(ra), index(rb)
+    changes = []
+    for k in sorted(set(ia) | set(ib)):
+        a, b = ia.get(k), ib.get(k)
+        if a == b:
+            continue
+        item = {"scenario": k[0], "trigger_ts": k[1], "target": k[2]}
+        if a is None:
+            item["op"] = "add"
+            item["to"] = b
+        elif b is None:
+            item["op"] = "remove"
+            item["from"] = a
+        else:
+            item["op"] = "replace"
+            if a["rule"] != b["rule"]:
+                item["rule_changed"] = True
+                item["rule_from"] = a["rule"]
+                item["rule_to"] = b["rule"]
+            if a["status"] != b["status"] or a["outcome"] != b["outcome"]:
+                item["verdict_from"] = {"status": a["status"],
+                                        "outcome": a["outcome"]}
+                item["verdict_to"] = {"status": b["status"],
+                                      "outcome": b["outcome"]}
+        changes.append(item)
+    return changes
+
+
 # ---------------------------------------------------------------- HTTP 层
 
 REASONS = {200: "OK", 201: "Created", 400: "Bad Request",
@@ -2633,8 +3315,9 @@ def make_app(db_path):
             return 409, {"error": "已签结，矩阵/事件/别名映射已冻结，拒绝新修订"}
         just = (body.get("justification") or "").strip()
         if not just:
-            return 400, {"error": "重绑设备、改时钟锚点、改触发/复合规则或"
-                                 "改响应佐证规则必须给出 justification 依据"}
+            return 400, {"error": "重绑设备、改时钟锚点、改触发/复合规则、"
+                                 "改响应佐证或主备切换规则必须给出 "
+                                 "justification 依据"}
         cur = conn.execute("SELECT MAX(rev) FROM revisions WHERE project=?",
                            (pid,)).fetchone()[0]
         base = get_rev(conn, pid, cur)["payload"]
@@ -2702,6 +3385,7 @@ def make_app(db_path):
             "payload_changes": diff_json(ra["payload"], rb["payload"]),
             "verdict_changes": verdict_changes(ra["result"], rb["result"]),
             "evidence_changes": evidence_changes(ra["result"], rb["result"]),
+            "failover_changes": failover_changes(ra["result"], rb["result"]),
             "justification": rb["justification"]}
 
     def app(environ, start_response):

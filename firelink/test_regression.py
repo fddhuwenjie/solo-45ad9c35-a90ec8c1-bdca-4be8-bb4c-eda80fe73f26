@@ -1156,5 +1156,565 @@ class LegacySingleTriggerCompatTest(unittest.TestCase):
         self.assertEqual(sc["instances"][0]["status"], "pass")
 
 
+# ---------------------------------------------------------------- 主备切换
+
+FO_DEVS = {"D1": {"type": "smoke"}, "F1": {"type": "fan"},
+           "FB": {"type": "fan"}, "C1": {"type": "controller"}}
+
+
+def fo_pulses():
+    return [{"device": d, "device_ts": 0, "master_ts": 0}
+            for d in FO_DEVS]
+
+
+def fo_ev(d, sig, ts, seq=1):
+    return {"device": d, "seq": seq, "signal": sig, "device_ts": ts}
+
+
+FO_RULE = {"fault": "C1:trip", "standby": "FB:start",
+           "switch_wait_ms": 5000, "total_ms": 30000,
+           "parallel_ms": 2000}
+
+
+def fo_payload(events, rule=None, composite=False, **kw):
+    """主备链载荷：D1 报警 -> F1 start(60s) 声明 failover。"""
+    fo = dict(rule or FO_RULE)
+    respond = [{"device": "F1", "signal": "start",
+                "within_ms": 60000, "failover": fo}]
+    if composite:
+        trigger = {"composite": {
+            "all": [{"device": "D1", "signal": "alarm"}],
+            "window_ms": 30000, "hold_ms": 0,
+            "reset": {"device": "P9", "signal": "reset"}}}
+    else:
+        trigger = {"trigger": {"device": "D1", "signal": "alarm"}}
+    p = {"sync_tolerance_ms": 150, "devices": dict(FO_DEVS),
+         "aliases": {},
+         "matrix": [dict(id="S", respond=respond, **trigger)],
+         "sync_pulses": fo_pulses(), "events": events}
+    p.update(kw)
+    return p
+
+
+def fo_block(result):
+    return result["scenarios"][0]["instances"][0]["failover"][0]
+
+
+class FailoverPrimarySuccessTest(unittest.TestCase):
+    """主机成功：无故障、无切换，闭合窗口后判 primary_success/pass。"""
+
+    def test_primary_success_closed_window(self):
+        # C1 在时限后仍有日志 -> 窗口闭合，主机正常启动，无 trip、无备机
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("F1", "start", 2000),
+            fo_ev("C1", "run", 35000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "primary_success")
+        self.assertEqual(b["status"], "ok")
+        self.assertEqual(r["status"], "pass")
+
+    def test_open_window_no_fault_keeps_unknown(self):
+        # 敞开窗口：日志末端在时限内，后续可能补来跳闸 -> 不臆断成功
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("F1", "start", 2000)]))
+        b = fo_block(r)
+        self.assertIsNone(b["outcome"])
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["findings"][-1]["reason"],
+                         "failover_window_open")
+        self.assertEqual(r["status"], "unknown")
+
+
+class FailoverLegalSwitchTest(unittest.TestCase):
+    """合法切换：故障坐实 -> 等满切换等待 -> 总时限内启备机。"""
+
+    EVENTS = [fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+              fo_ev("FB", "start", 9000)]
+
+    def test_legal_switch_overrides_primary_timeout(self):
+        r = evaluate(fo_payload(self.EVENTS))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "legal_switch")
+        self.assertEqual(b["status"], "ok")
+        # 主机自身的 timeout fail 被合法切换覆盖，整体 pass
+        self.assertEqual(r["status"], "pass")
+        to = [f for sc in r["scenarios"] for i in sc["instances"]
+              for f in i["findings"] if f.get("type") == "timeout"][0]
+        self.assertEqual(to.get("superseded_by"), "failover")
+        self.assertNotIn("first", to)
+        f = [f for f in b["findings"]
+             if f["reason"] == "legal_switch"][0]
+        self.assertEqual(f["elapsed_ms"], 5000)      # 故障->备启恰等满
+        self.assertEqual(f["total_elapsed_ms"], 8000)
+        self.assertEqual(f["fault"]["device"], "C1")
+        self.assertEqual(f["standby"]["device"], "FB")
+
+    def test_legal_switch_under_composite_trigger(self):
+        r = evaluate(fo_payload(
+            self.EVENTS + [fo_ev("P9", "reset", 90000)], composite=True))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "legal_switch")
+        self.assertEqual(r["status"], "pass")
+
+    def test_switch_before_wait_is_spurious(self):
+        # 故障 4000，等待 5000，备机 6000（仅 2s）-> 过早切换
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+            fo_ev("FB", "start", 6000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "spurious_switch")
+        self.assertEqual(b["findings"][-1]["reason"],
+                         "switch_before_wait")
+        self.assertEqual(r["status"], "fail")
+
+    def test_fault_after_standby_does_not_authorize(self):
+        # 备机 9s 先启，故障 12s 才到：切换时故障未坐实，不构成合法切换
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 9000),
+            fo_ev("C1", "trip", 12000), fo_ev("C1", "run", 40000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "spurious_switch")
+        self.assertEqual(r["status"], "fail")
+
+
+class FailoverStandbyTimeoutTest(unittest.TestCase):
+    """故障坐实但总时限内未启备用 -> standby_timeout/fail。"""
+
+    def test_standby_timeout_after_fault(self):
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+            fo_ev("FB", "start", 40000)]))             # 超过 30s 总时限
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "standby_timeout")
+        self.assertEqual(b["status"], "fail")
+        self.assertEqual(b["findings"][-1]["deadline"], 31000)
+        self.assertEqual(r["status"], "fail")
+
+    def test_open_window_no_fault_no_standby_unknown(self):
+        r = evaluate(fo_payload([fo_ev("D1", "alarm", 1000)]))
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["findings"][-1]["reason"],
+                         "failover_window_open")
+        self.assertEqual(r["status"], "unknown")
+
+    def test_contradiction_primary_dead_closed_without_switch(self):
+        # 主机反馈到但佐证相斥（跳闸坐实），窗口闭合仍无备机 -> 未切换 fail
+        ev = {"combine": "all", "window_ms": 8000,
+              "duration_ms": 1000, "missing_ms": 3000,
+              "sources": [{"device": "I1", "signal": "I",
+                           "range": {"min": 5, "max": 20, "unit": "A"}}]}
+        p = fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("F1", "start", 2000),
+            {"device": "I1", "seq": 1, "signal": "I",
+             "device_ts": 2200, "value": 0.0, "unit": "A"},
+            {"device": "I1", "seq": 2, "signal": "I",
+             "device_ts": 4000, "value": 0.0, "unit": "A"},
+            fo_ev("C1", "run", 40000)], rule=FO_RULE)
+        p["devices"]["I1"] = {"type": "ammeter"}
+        p["sync_pulses"] = [{"device": d, "device_ts": 0, "master_ts": 0}
+                            for d in p["devices"]]
+        p["matrix"][0]["respond"][0]["evidence"] = ev
+        r = evaluate(p)
+        b = fo_block(r)
+        self.assertEqual(b["status"], "fail")
+        self.assertEqual(b["outcome"], "standby_timeout")
+
+
+class FailoverSpuriousParallelTest(unittest.TestCase):
+    """误切换（主机只是反馈迟到）与双机超时并行。"""
+
+    def test_short_parallel_is_spurious_switch(self):
+        # 备机 3s 启（无故障），主机 4s 迟到，并行 1s <= 2s 宽限
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("F1", "start", 4000), fo_ev("C1", "run", 35000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "spurious_switch")
+        self.assertEqual(b["findings"][-1]["reason"], "spurious_switch")
+        self.assertEqual(r["status"], "fail")
+
+    def test_long_parallel_is_overrun(self):
+        # 备机 3s 启，主机 12s 才到，并行 9s > 2s -> 双机超时并行
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("F1", "start", 12000), fo_ev("C1", "run", 35000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "parallel_overrun")
+        f = b["findings"][-1]
+        self.assertEqual(f["reason"], "parallel_overrun")
+        self.assertEqual(f["parallel_from"], 3000)
+        self.assertEqual(f["parallel_to"], 12000)
+        self.assertEqual(f["over_ms"], 7000)
+        self.assertEqual(r["status"], "fail")
+
+    def test_late_fault_overrun(self):
+        # 备机 3s 启，故障 10s 才报：并行持续 7s > 2s -> 超时并行
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("C1", "trip", 10000), fo_ev("C1", "run", 35000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "parallel_overrun")
+
+
+class FailoverEvidenceTest(unittest.TestCase):
+    """主机运行佐证参与并行判定；佐证未决保持 unknown。"""
+
+    EVIDENCE = {"combine": "all", "window_ms": 15000,
+                "duration_ms": 1000, "missing_ms": 3000,
+                "sources": [{"device": "I1", "signal": "I",
+                             "range": {"min": 5, "max": 20, "unit": "A"}}]}
+
+    def _p(self, events, composite=True):
+        devs = dict(FO_DEVS)
+        devs["I1"] = {"type": "ammeter"}
+        if composite:
+            devs["P9"] = {"type": "panel"}
+        fo = dict(FO_RULE)
+        respond = [{"device": "F1", "signal": "start",
+                    "within_ms": 60000, "failover": fo,
+                    "evidence": self.EVIDENCE}]
+        trig = ({"composite": {"all": [{"device": "D1", "signal": "alarm"}],
+                               "window_ms": 30000, "hold_ms": 0,
+                               "reset": {"device": "P9",
+                                         "signal": "reset"}}}
+                if composite else
+                {"trigger": {"device": "D1", "signal": "alarm"}})
+        return {"devices": devs, "aliases": {},
+                "matrix": [dict(id="S", respond=respond, **trig)],
+                "sync_pulses": [{"device": d, "device_ts": 0,
+                                 "master_ts": 0} for d in devs],
+                "events": events}
+
+    def smp(self, ts, seq, v):
+        return {"device": "I1", "seq": seq, "signal": "I",
+                "device_ts": ts, "value": v, "unit": "A"}
+
+    def test_running_evidence_overrun_open_window(self):
+        # 备机 3s 启（无故障），主机反馈 3.5s，电流 8A 持续到 8s，
+        # 敞开窗口下只认已观测：并行 3.5..8 > 2s -> 超时并行
+        r = evaluate(self._p([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("F1", "start", 3500),
+            self.smp(3600, 1, 8.0), self.smp(5000, 2, 8.0),
+            self.smp(8000, 3, 8.0), fo_ev("C1", "run", 40000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "parallel_overrun")
+        self.assertEqual(r["status"], "fail")
+
+    def test_running_evidence_overrun_closed_cap(self):
+        # 闭合窗口（P9 10s 复位）：样本持续在范围到 9s，允许插值到 cap
+        r = evaluate(self._p([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("F1", "start", 3500),
+            self.smp(3600, 1, 8.0), self.smp(6000, 2, 8.0),
+            self.smp(9000, 3, 8.0), fo_ev("P9", "reset", 10000)]))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "parallel_overrun")
+
+    def test_evidence_pending_keeps_unknown(self):
+        # 备机 3s 启，主机反馈 3.5s，但佐证窗口内只有两条样本且敞开、
+        # 覆盖不足 -> 主机佐证未决，不臆断并行 -> unknown
+        r = evaluate(self._p([
+            fo_ev("D1", "alarm", 1000), fo_ev("FB", "start", 3000),
+            fo_ev("F1", "start", 3500),
+            self.smp(3600, 1, 8.0), self.smp(4000, 2, 8.0),
+            fo_ev("C1", "run", 40000)]))
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+        self.assertIsNone(b["outcome"])
+        self.assertEqual(b["findings"][-1]["reason"],
+                         "primary_evidence_pending")
+        self.assertEqual(r["status"], "unknown")
+
+    def test_dead_primary_legal_switch_ignores_contradiction_window(self):
+        # 故障 4s 坐实，佐证相斥区间在宽限内结束，备机 9s 合法切换
+        r = evaluate(self._p([
+            fo_ev("D1", "alarm", 1000), fo_ev("F1", "start", 2000),
+            self.smp(2200, 1, 0.0), self.smp(3000, 2, 0.0),
+            fo_ev("C1", "trip", 4000), fo_ev("FB", "start", 9000),
+            fo_ev("P9", "reset", 90000)], composite=True))
+        b = fo_block(r)
+        self.assertEqual(b["outcome"], "legal_switch")
+        self.assertEqual(r["status"], "pass")
+
+
+class FailoverGapClockTest(unittest.TestCase):
+    """故障日志缺号 / 时钟不可信 / 备用缺号 -> unknown。"""
+
+    def test_fault_log_gap_unknown(self):
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "run", 3000),
+            {"device": "C1", "seq": 3, "signal": "trip",
+             "device_ts": 4000},                        # C1 缺 seq=2
+            fo_ev("FB", "start", 10000)]))
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["findings"][-1]["reason"], "log_gap")
+        self.assertEqual(r["status"], "unknown")        # 主机 timeout 被遮蔽
+
+    def test_fault_clock_untrusted_unknown(self):
+        p = fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+            fo_ev("FB", "start", 10000)])
+        p["sync_pulses"].append(
+            {"device": "C1", "device_ts": 100000, "master_ts": 100500})
+        r = evaluate(p)
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["findings"][-1]["reason"],
+                         "clock_residual_out_of_bounds")
+        self.assertEqual(r["status"], "unknown")
+
+    def test_standby_log_gap_unknown(self):
+        r = evaluate(fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+            {"device": "FB", "seq": 3, "signal": "start",
+             "device_ts": 10000}]))                      # FB 缺 seq=1,2
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+        self.assertEqual(b["findings"][-1]["reason"], "log_gap")
+
+    def test_trigger_unconfirmed_unknown(self):
+        # 复合触发未确认：实例 trigger_ts=None -> 主备链 unknown
+        p = fo_payload([fo_ev("D1", "run", 1000)], composite=True)
+        r = evaluate(p)
+        insts = r["scenarios"][0]["instances"]
+        self.assertTrue(any(
+            any(b["status"] == "unknown"
+                and b["findings"][-1]["reason"] == "trigger_not_confirmed"
+                for b in i.get("failover", []))
+            for i in insts))
+
+
+class FailoverStructureTest(unittest.TestCase):
+    """结构非法 / primary 不一致 / 备用归属多解 -> unknown 并列非法说明。"""
+
+    def test_missing_fields_invalid(self):
+        r = evaluate(fo_payload(
+            [fo_ev("D1", "alarm", 1000)],
+            rule={"fault": "C1:trip", "standby": "FB:start"}))
+        plan = r["scenarios"][0]["failover_rules"][0]
+        self.assertFalse(plan["valid"])
+        reasons = {g["reason"] for g in plan["rule"]["invalid"]}
+        self.assertIn("invalid_failover", reasons)
+        b = fo_block(r)
+        self.assertEqual(b["status"], "unknown")
+
+    def test_primary_mismatch_invalid(self):
+        r = evaluate(fo_payload(
+            [fo_ev("D1", "alarm", 1000)],
+            rule={"primary": "OTHER:start", "fault": "C1:trip",
+                  "standby": "FB:start", "switch_wait_ms": 5000,
+                  "total_ms": 30000, "parallel_ms": 2000}))
+        plan = r["scenarios"][0]["failover_rules"][0]
+        self.assertFalse(plan["valid"])
+        self.assertTrue(any(
+            g["reason"] == "failover_primary_mismatch"
+            for g in plan["rule"]["invalid"]))
+
+    def test_ambiguous_fault_alias_invalid(self):
+        p = fo_payload([fo_ev("D1", "alarm", 1000)],
+                       rule={"fault": "控制器:trip", "standby": "FB:start",
+                             "switch_wait_ms": 5000, "total_ms": 30000,
+                             "parallel_ms": 2000})
+        p["aliases"] = {"控制器": ["C1", "FB"]}
+        r = evaluate(p)
+        plan = r["scenarios"][0]["failover_rules"][0]
+        self.assertFalse(plan["valid"])
+        self.assertTrue(any(g["reason"] == "alias_ambiguous"
+                            for g in plan["rule"]["invalid"]))
+
+    def test_shared_group_ambiguous_standby(self):
+        # 同组两条规则 standby 端点不同 -> 备用归属多解，两边都 unknown
+        devs = dict(FO_DEVS)
+        devs["D2"] = {"type": "smoke"}
+        pulses = [{"device": d, "device_ts": 0, "master_ts": 0}
+                  for d in devs]
+
+        def resp(standby):
+            return {"device": "F1", "signal": "start", "within_ms": 60000,
+                    "failover": {"fault": "C1:trip", "standby": standby,
+                                 "group": "G1", "switch_wait_ms": 5000,
+                                 "total_ms": 30000, "parallel_ms": 2000}}
+        p = {"devices": devs, "aliases": {}, "sync_pulses": pulses,
+             "matrix": [
+                 {"id": "A", "trigger": {"device": "D1", "signal": "alarm"},
+                  "respond": [resp("FB:start")]},
+                 {"id": "B", "trigger": {"device": "D2", "signal": "alarm"},
+                  "respond": [resp("F1:start")]}],
+             "events": [fo_ev("D1", "alarm", 1000),
+                        fo_ev("D2", "alarm", 2000)]}
+        r = evaluate(p)
+        for sc in r["scenarios"]:
+            plan = sc["failover_rules"][0]
+            self.assertFalse(plan["valid"])
+            self.assertTrue(any(
+                g["reason"] == "standby_group_ambiguous"
+                for g in plan["rule"]["invalid"]))
+
+
+class FailoverContentionTest(unittest.TestCase):
+    """多分区争用同一备用机：按触发时刻独占，先触发先得。"""
+
+    DEVS = {"DA": {}, "DB": {}, "FA": {}, "FB": {}, "CA": {}, "CB": {}}
+
+    def _payload(self):
+        def fo(fault):
+            return {"fault": fault, "standby": "FB:start", "group": "G1",
+                    "switch_wait_ms": 5000, "total_ms": 30000,
+                    "parallel_ms": 2000}
+        return {"devices": dict(self.DEVS), "aliases": {},
+                "sync_pulses": [{"device": d, "device_ts": 0,
+                                 "master_ts": 0} for d in self.DEVS],
+                "matrix": [
+                    {"id": "A", "trigger": {"device": "DA",
+                                            "signal": "alarm"},
+                     "respond": [{"device": "FA", "signal": "start",
+                                  "within_ms": 60000,
+                                  "failover": fo("CA:trip")}]},
+                    {"id": "B", "trigger": {"device": "DB",
+                                            "signal": "alarm"},
+                     "respond": [{"device": "FA", "signal": "start",
+                                  "within_ms": 60000,
+                                  "failover": fo("CB:trip")}]}]}
+
+    def test_earlier_trigger_occupies_standby(self):
+        p = self._payload()
+        p["events"] = [
+            fo_ev("DA", "alarm", 1000), fo_ev("CA", "trip", 3000),
+            fo_ev("DB", "alarm", 5000), fo_ev("CB", "trip", 7000),
+            fo_ev("FB", "start", 9000),                     # 归 A
+            fo_ev("CA", "run", 40000), fo_ev("CB", "run", 40000),
+            fo_ev("FB", "start", 45000, 2)]                 # B 窗口外
+        r = evaluate(p)
+        blocks = {}
+        for sc in r["scenarios"]:
+            for inst in sc["instances"]:
+                blocks[sc["id"]] = inst["failover"][0]
+        self.assertEqual(blocks["A"]["outcome"], "legal_switch")
+        self.assertEqual(blocks["B"]["status"], "fail")
+        self.assertEqual(blocks["B"]["outcome"], "standby_timeout")
+        f = blocks["B"]["findings"][-1]
+        self.assertEqual(f["reason"], "standby_occupied")
+        self.assertEqual(f["occupied_by"]["rule"], "A")
+        self.assertEqual(f["occupied_by"]["trigger_ts"], 1000)
+
+    def test_distinct_standby_events_serve_both(self):
+        # B 的窗口内还有第二条空闲备用启动 -> B 也能合法切换
+        p = self._payload()
+        p["events"] = [
+            fo_ev("DA", "alarm", 1000), fo_ev("CA", "trip", 3000),
+            fo_ev("DB", "alarm", 5000), fo_ev("CB", "trip", 13000),
+            fo_ev("FB", "start", 9000),                      # 归 A
+            fo_ev("FB", "start", 20000, 2),                  # 归 B（<35s）
+            fo_ev("CA", "run", 40000), fo_ev("CB", "run", 40000)]
+        r = evaluate(p)
+        blocks = {}
+        for sc in r["scenarios"]:
+            for inst in sc["instances"]:
+                blocks[sc["id"]] = inst["failover"][0]
+        self.assertEqual(blocks["A"]["outcome"], "legal_switch")
+        self.assertEqual(blocks["B"]["outcome"], "legal_switch")
+        self.assertNotEqual(
+            blocks["A"]["findings"][-1]["standby"]["seq"],
+            blocks["B"]["findings"][-1]["standby"]["seq"])
+
+
+class FailoverRevisionHttpTest(unittest.TestCase):
+    """主备规则纳入修订/重放/差异/签结；旧版判定保持不变。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = make_server("127.0.0.1", PORT + 2, make_app(":memory:"))
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def call(self, method, path, body=None):
+        data = json.dumps(body, ensure_ascii=False).encode() \
+            if body is not None else None
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT + 2}{path}", data=data, method=method,
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def test_revision_pins_choice_chain_and_diff(self):
+        # rev1：故障后等待参数过严（等待 8s），备机 9s 启 -> 过早切换 fail
+        p1 = fo_payload([
+            fo_ev("D1", "alarm", 1000), fo_ev("C1", "trip", 4000),
+            fo_ev("FB", "start", 9000)],
+            rule={"fault": "C1:trip", "standby": "FB:start",
+                  "switch_wait_ms": 8000, "total_ms": 30000,
+                  "parallel_ms": 2000})
+        code, o = self.call("POST", "/projects", p1)
+        self.assertEqual((code, o["status"]), (201, "fail"))
+        pid = o["project"]
+        # rev2：等待改回 5s（附依据）-> 合法切换 pass
+        p2 = json.loads(json.dumps(p1))
+        p2["matrix"][0]["respond"][0]["failover"]["switch_wait_ms"] = 5000
+        code, _ = self.call("POST", f"/projects/{pid}/revisions",
+                            {"payload": p2})
+        self.assertEqual(code, 400)                    # 缺 justification
+        code, o = self.call("POST", f"/projects/{pid}/revisions",
+                            {"justification": "按验收现场整定单把切换等待"
+                                              "由 8s 改为 5s",
+                             "payload": p2})
+        self.assertEqual((code, o["rev"], o["status"]), (201, 2, "pass"))
+        # 旧版重放：选择链与采用事件固定，仍为 fail
+        code, o = self.call("GET", f"/projects/{pid}/revisions/1")
+        b = (o["replay"]["scenarios"][0]["instances"][0]
+             ["failover"][0])
+        self.assertEqual(b["rule"]["switch_wait_ms"], 8000)
+        self.assertEqual(b["outcome"], "spurious_switch")
+        # 新版
+        code, o = self.call("GET", f"/projects/{pid}/revisions/2")
+        b = (o["replay"]["scenarios"][0]["instances"][0]
+             ["failover"][0])
+        self.assertEqual(b["outcome"], "legal_switch")
+        # diff：主备规则与结论差异
+        code, o = self.call("GET", f"/projects/{pid}/diff?from=1&to=2")
+        ch = o["failover_changes"][0]
+        self.assertTrue(ch["rule_changed"])
+        self.assertEqual(ch["rule_from"]["switch_wait_ms"], 8000)
+        self.assertEqual(ch["rule_to"]["switch_wait_ms"], 5000)
+        self.assertEqual(ch["verdict_from"]["outcome"], "spurious_switch")
+        self.assertEqual(ch["verdict_to"]["outcome"], "legal_switch")
+        # 签结后冻结
+        code, _ = self.call("POST", f"/projects/{pid}/signoff")
+        self.assertEqual(code, 200)
+        code, _ = self.call("POST", f"/projects/{pid}/revisions",
+                            {"justification": "签结后改主备参数",
+                             "payload": p2})
+        self.assertEqual(code, 409)
+
+
+class FailoverBackwardCompatTest(unittest.TestCase):
+    """未声明 failover 的旧请求演算结果完全不变。"""
+
+    def test_no_failover_key_in_replay(self):
+        p = base_payload(
+            matrix=[{"id": "S",
+                     "trigger": {"device": "TD", "signal": "alarm"},
+                     "respond": [{"device": "R2", "signal": "start",
+                                  "within_ms": 60000}]}],
+            events=[{"device": "TD", "seq": 1, "signal": "alarm",
+                     "device_ts": 1000},
+                    {"device": "R2", "seq": 1, "signal": "start",
+                     "device_ts": 2000}])
+        r = evaluate(p)
+        sc = r["scenarios"][0]
+        self.assertNotIn("failover_rules", sc)
+        self.assertNotIn("failover", sc["instances"][0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
