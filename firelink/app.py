@@ -970,9 +970,13 @@ def evaluate(p):
     matrix_rules = p.get("matrix", []) or []
 
     def ev_ref(ev):
-        return ({"device": ev["device"], "seq": ev.get("seq"),
-                 "signal": ev["signal"], "ts": ev["ts"]}
-                if ev is not None else None)
+        if ev is None:
+            return None
+        ref = {"device": ev["device"], "seq": ev.get("seq"),
+               "signal": ev["signal"], "ts": ev["ts"]}
+        if ev.get("value") is not None:
+            ref["value"] = ev.get("value")
+        return ref
 
     def find_events(dev, sig, lo=None, hi=None, before_next=None):
         """窗口内同信号事件；before_next 为下一轮触发时刻（恢复窗口上界）。"""
@@ -1317,14 +1321,16 @@ def evaluate(p):
             return st
 
         # 阶段 2：值班员复位（复位来源须可核对，且应晚于全部解除；
-        # 面板复位走跨实例申领，多分区并发的同刻复位可共用一条）
+        # 逐实例独占申领，多分区并发时各绑定各自的复位记录）
         rep = spec["reset"]
         ev0, code, why, g = claim_event(
-            rep["device"], rep["signal"], clear_ts,
-            hard_next=next_ts, want_value=rep.get("value"),
-            lo_seq0=anchor_seq.get(rep["device"]))
-        if ev0 is not None and rep.get("value") is not None \
-                and ev0.get("value") != rep.get("value"):
+            rep["device"], rep["signal"], clear_ts, mode="exclusive",
+            hard_next=next_ts, lo_seq0=anchor_seq.get(rep["device"]))
+        # 来源核对在取到事件之后做：来源不符按“复位来源不明”判 unknown，
+        # 不预过滤事件、也不另立 fail 前置项（避免 fail/unknown 自相矛盾）。
+        source_unknown = ev0 is not None and rep.get("value") is not None \
+            and ev0.get("value") != rep.get("value")
+        if source_unknown:
             code, why = "unknown", "reset_source_unknown"
         rent = {"endpoint": f"{rep['device']}:{rep['signal']}",
                 "status": "unknown", "actual": None, "seq": None}
@@ -1332,9 +1338,11 @@ def evaluate(p):
             rent.update(status="ok", actual=ev0["ts"], seq=ev0.get("seq"),
                         event=ev_ref(ev0))
             st["reset"] = rent
-        elif ev0 is not None and rep.get("value") is not None:
-            rent.update(reason="reset_source_unknown", event=ev_ref(ev0))
-            st["reset"], st["pre_unknown"] = rent, "reset_source_unknown"
+        elif source_unknown:
+            rent.update(reason="reset_source_unknown", actual=ev0["ts"],
+                        seq=ev0.get("seq"), event=ev_ref(ev0))
+            st["reset"] = rent
+            st["pre_unknown"] = "reset_source_unknown"
             return st
         else:
             rent["reason"] = ("reset_missing" if code == "fail" else why)
@@ -1348,14 +1356,18 @@ def evaluate(p):
             return st
         reset_ts, reset_seq = rent["actual"], rent["seq"]
 
-        # 阶段 3：锁存确认（申领确认事件并绑定本实例；同一确认事件被
+        # 阶段 3：锁存确认（逐实例独占申领并绑定本实例；同一确认记录被
         # 多轮复用在汇总阶段判 fail）
         if spec["ack"]:
             aep = spec["ack"]
             ev0, code, why, g = claim_event(
-                aep["device"], aep["signal"], reset_ts,
-                hard_next=next_ts, want_value=aep.get("value"),
-                lo_seq0=reset_seq)
+                aep["device"], aep["signal"], reset_ts, mode="exclusive",
+                hard_next=next_ts, lo_seq0=reset_seq)
+            ack_source_unknown = ev0 is not None \
+                and aep.get("value") is not None \
+                and ev0.get("value") != aep.get("value")
+            if ack_source_unknown:
+                code, why = "unknown", "ack_source_unknown"
             aent = {"endpoint": f"{aep['device']}:{aep['signal']}",
                     "status": "unknown", "actual": None, "seq": None}
             if code == "ok":
@@ -1366,6 +1378,9 @@ def evaluate(p):
                 aent["reason"] = ("ack_missing" if code == "fail" else why)
                 if g:
                     aent["gap"] = g
+                if ev0 is not None:
+                    aent.update(actual=ev0["ts"], seq=ev0.get("seq"),
+                                event=ev_ref(ev0))
                 st["ack"] = aent
                 if code == "fail":
                     st["pre_fail"] = "ack_missing"
@@ -1460,7 +1475,7 @@ def evaluate(p):
             shared_status = None
             if is_shared:
                 ev0, shared_status, why0, g0 = claim_event(
-                    d, sp["signal"], lo_step, shared=True)
+                    d, sp["signal"], lo_step, mode="shared")
                 window_evs = [ev0] if ev0 else []
             else:
                 # 非公共设备仍从复位时刻起取，以捕捉“先于前置回位”的倒序
@@ -1545,48 +1560,61 @@ def evaluate(p):
     # 公共设备回位事件的跨实例申领：同一回位动作可同时释放多个并发占用
     # 分区（同刻共用）；其后的实例从下一条回位申领。按全局触发时刻交错
     # 求解，使申领顺序与占用发生顺序一致。
-    shared_claims = {}   # (dev,sig) -> list of claimed events
+    shared_claims = {}      # (dev,sig) -> 已被申领的公共设备回位事件
+    # 复位 / 锁存确认走逐实例独占申领：同一条记录只能绑定一个触发实例，
+    # 多分区并发时各取各的 seq，避免都取 seq=1 后误报确认复用。
+    exclusive_claims = {}   # (dev,sig) -> 已被某实例占用的 reset/ack 事件
 
-    def claim_event(dev, sig, lo_ts, shared=False, hard_next=None,
-                    want_value=None, lo_seq0=None):
+    def claim_event(dev, sig, lo_ts, mode="own", hard_next=None,
+                    lo_seq0=None):
         """取本实例在 lo_ts 之后的动作。
-        * shared=True（公共设备回位）：跨实例申领，同一物理回位动作可同时
-          释放多个并发占用分区（同刻共用），其后的实例从下一条回位继续。
-        * 面板复位/锁存确认等非共享信号：每实例独立取事件，不占全局名额。
+        mode='shared'    公共设备回位：跨实例申领，同刻物理回位可被多个并发
+                         占用分区共用，其后的实例从下一条回位继续。
+        mode='exclusive' 复位/锁存确认：每条记录全局只绑定一个实例，同刻也
+                         不共用，按触发顺序逐个占用。
+        mode='own'（默认）每实例独立取事件，不占全局名额。
+        来源（value）不在此预过滤：先取信号事件，由调用方核对来源，来源
+        不符按“来源不明”判 unknown，而不是把事件过滤掉后误判 fail。
         返回 (event, code, why, gap)，code ∈ ok/fail/unknown。"""
         if dev in untrusted:
             return None, "unknown", "clock_residual_out_of_bounds", None
-        if shared:
-            key = (dev, sig)
-            used = shared_claims.setdefault(key, [])
+        if mode == "shared":
+            used = shared_claims.setdefault((dev, sig), [])
+            same_ts_share = True
+        elif mode == "exclusive":
+            used = exclusive_claims.setdefault((dev, sig), [])
+            same_ts_share = False
         else:
-            used = []
+            used, same_ts_share = [], False
         used_keys = {(u["ts"], u.get("seq")) for u in used}
         pool = sorted((e for e in by_dev.get(dev, [])
                        if e["signal"] == sig and e["ts"] >= lo_ts
-                       and (hard_next is None or e["ts"] < hard_next)
-                       and (want_value is None
-                            or e.get("value") == want_value)),
+                       and (hard_next is None or e["ts"] < hard_next)),
                       key=lambda e: (e["ts"], e["seq"]))
         cands = []
         for e in pool:
-            # 同刻事件允许并发占用实例共用；否则已申领事件不得再取
-            if (e["ts"], e.get("seq")) in used_keys and \
-                    not any(u["ts"] == e["ts"] for u in used):
-                continue
+            if (e["ts"], e.get("seq")) in used_keys and not same_ts_share:
+                continue   # 独占/独立：已被占用的记录不得再取
+            if same_ts_share and (e["ts"], e.get("seq")) in used_keys \
+                    and not any(u["ts"] == e["ts"] for u in used):
+                continue   # 共享：同刻允许并发复用，否则跳过
             cands.append(e)
         ev0 = cands[0] if cands else None
         lo_seq = lo_seq0
-        if shared and lo_seq is None:
+        if mode in ("shared", "exclusive") and lo_seq is None:
             lo_seq = max((u.get("seq") for u in used
                           if u.get("seq") is not None), default=None)
+        consume = mode in ("shared", "exclusive")
         if ev0 is not None:
             g = (seq_gap_between(dev, lo_seq, ev0.get("seq"))
                  if lo_seq is not None and ev0.get("seq") is not None
                  else None)
             if g:
+                # 缺口记录也先占用，避免并发的后续实例重复绑定同一条
+                if consume:
+                    used.append(ev0)
                 return ev0, "unknown", "log_gap", g
-            if shared:
+            if consume:
                 used.append(ev0)
             return ev0, "ok", None, None
         # 无候选：本轮窗口内的末尾 seq（hard_next 之前），其后缺号可能藏事件
@@ -1603,10 +1631,15 @@ def evaluate(p):
              if lo_seq is not None else None)
         if g:
             return None, "unknown", "log_gap", g
+        # 本轮未闭合（无下一轮触发截断）：恢复窗口仍敞开，后续可能补来事件，
+        # 证据不完整 -> 保持 unknown，不得在敞开窗口上直接判 fail；
+        # 仅当本轮已被下一轮触发（hard_next）截断仍无事件时才判 fail。
+        if hard_next is None:
+            return None, "unknown", "recovery_window_open", None
         return None, "fail", "missing", None
 
     def claim_shared(dev, sig, lo_ts):
-        return claim_event(dev, sig, lo_ts, shared=True)
+        return claim_event(dev, sig, lo_ts, mode="shared")
 
     def release_claim(dev, sig, ev0):
         """回退一次申领（事件早于本实例可用时刻 -> 让给并发的更早实例）。"""
@@ -1752,7 +1785,12 @@ def evaluate(p):
             findings.append({"type": "recovery_precondition",
                              "status": "fail", "reason": st["pre_fail"],
                              "upstream": ["recovery"]})
-        if st.get("pre_unknown"):
+        # 复位/确认“来源不明”已有对应的具体 recovery_reset/recovery_ack
+        # finding（并定位原始事件），这里不再补泛化的前置 unknown，避免
+        # 同一原因产生两条相互重复甚至矛盾的判定。
+        _SPECIFIC_UNKNOWN = {"reset_source_unknown", "ack_source_unknown"}
+        if st.get("pre_unknown") and \
+                st["pre_unknown"] not in _SPECIFIC_UNKNOWN:
             findings.append({"type": "recovery_precondition",
                              "status": "unknown", "reason": st["pre_unknown"],
                              "upstream": ["recovery"]})
@@ -1770,6 +1808,8 @@ def evaluate(p):
                  "upstream": [st["reset"]["endpoint"]]}
             if st["reset"].get("gap"):
                 f["gap"] = st["reset"]["gap"]
+            if st["reset"].get("event"):
+                f["event"] = ev_ref(st["reset"]["event"])
             findings.append(f)
         if st.get("ack") and st["ack"]["status"] == "unknown":
             f = {"type": "recovery_ack", "target": st["ack"]["endpoint"],
@@ -1777,6 +1817,8 @@ def evaluate(p):
                  "upstream": [st["ack"]["endpoint"]]}
             if st["ack"].get("gap"):
                 f["gap"] = st["ack"]["gap"]
+            if st["ack"].get("event"):
+                f["event"] = ev_ref(st["ack"]["event"])
             findings.append(f)
         findings += [dict(x) for x in st.get("steps", [])]
         timeouts = [f for f in findings
