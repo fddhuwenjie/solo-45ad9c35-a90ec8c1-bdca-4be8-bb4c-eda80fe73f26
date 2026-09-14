@@ -23,6 +23,20 @@
   * 设备提前回位 / 恢复超时 / 前置实例仍有效 / 同一确认多轮复用 -> fail；
     解除日志缺号 / 复位来源不明 / 校时不可信 / 窗口敞开 -> unknown。
   * 规则中不含 recovery 段的旧请求演算结果完全不变。
+- 响应佐证（evidence）：离散反馈（风机运行触点、风阀到位开关）可能粘连或
+  误报，仅凭“信号到了”就认定动作完成会漏掉“信号到了、设备没动”。每个
+  respond 可声明 evidence 段，把反馈与电流、风压、阀位等模拟量采样绑定到
+  同一触发实例：
+  * sources 各声明 {device, signal, window_ms, range:{min,max,unit},
+    duration_ms, missing_ms}；顶层 evidence 可给 combine(all/any/k_of_n)
+    与各参数的共享缺省，事件可携带 value 与 unit。
+  * 采样窗口相对反馈时刻；佐证须在窗口内持续落入有效范围至少 duration_ms，
+    相邻样本间隔超出 missing_ms = 采样断档；同族单位自动换算（A/mA、
+    Pa/hPa/kPa/MPa/mbar/bar、%/ratio）。
+  * 汇总返回采用样本与最早分歧区间：佐证越界（或持续与反馈相斥）判 fail；
+    单位无法换算、采样断档、日志缺号、窗口敞开/证据不足保持 unknown。
+  * 未声明 evidence 的旧 respond 演算结果完全不变；归一化佐证规则、采用
+    样本与分歧区间固定进重放 JSON，改佐证规则必须附 justification 另起修订。
 - 日志缺号 / 别名多解 / 校时残差越界 / 前置状态不明 -> 相应环节保持 unknown。
 - 重绑设备或改时钟锚点、改触发规则必须附 justification，系统另起修订并
   保留旧演算（重放 JSON 固定当时的归一化复合规则、组成事件与实例判定）。
@@ -35,7 +49,17 @@
   devices          {设备号: {type, zone, ...}}
   aliases          {别名: 设备号 或 [设备号, ...]}   # 多解即歧义
   matrix           [{id, trigger:{device,signal},                     # 旧写法，兼容
-                     respond:[{device,signal,within_ms,after:["DEV:SIG"]}]}
+                     respond:[{device,signal,within_ms,after:["DEV:SIG"],
+                               # 响应佐证（可选；不声明则维持离散反馈原判定）:
+                               evidence:{
+                                 combine: "all"|"any"|"k_of_n", k: 2,
+                                 window_ms, range:{min,max,unit},  # 共享缺省
+                                 duration_ms, missing_ms,
+                                 sources: [
+                                   {device, signal, window_ms?,
+                                    range:{min,max,unit},      # 同族单位可换算
+                                    duration_ms?, missing_ms?},
+                                   "DEV:SIG"]}}]}]}
                     # 复合写法（trigger 旁并列 composite，或仅给 composite）:
                     {id, composite:{
                        all|any|k_of_n: [叶子, ...],
@@ -51,11 +75,12 @@
   sync_tolerance_ms  校时残差容限，默认 150
   sync_pulses      [{device, device_ts, master_ts}]
   bypass_permits   [{device, start, end, reason}]   # 统一时轴上的许可窗口
-  events           [{device, seq, signal, device_ts, value?}]
+  events           [{device, seq, signal, device_ts, value?, unit?}]
 
 """
 
 import json
+import numbers
 import re
 import sqlite3
 import sys
@@ -80,6 +105,38 @@ def db_connect(path):
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.executescript(SCHEMA)
     return conn
+
+
+# ---------------------------------------------------------------- 单位换算
+# 同族单位 -> 换算到族基准单位的乘数；跨族（A/Pa/%）不可换算。
+#   电流: A / mA；风压: Pa / hPa / kPa / MPa / mbar / bar；
+#   阀位: % / ratio。未登记单位只与同符号单位比较。
+UNIT_FACTORS = {
+    "a": ("current", 1.0), "ma": ("current", 1e-3),
+    "pa": ("pressure", 1.0), "hpa": ("pressure", 1e2),
+    "kpa": ("pressure", 1e3), "mpa": ("pressure", 1e6),
+    "mbar": ("pressure", 1e2), "bar": ("pressure", 1e5),
+    "%": ("position", 0.01), "percent": ("position", 0.01),
+    "pct": ("position", 0.01), "ratio": ("position", 1.0),
+}
+
+
+def convert_unit(value, unit, base_unit):
+    """把 value 从 unit 换算到 base_unit；跨族/未知单位不可换算 -> None。"""
+    u = (unit or base_unit or "").strip().lower()
+    b = (base_unit or "").strip().lower()
+    if not b:
+        return value if not u or UNIT_FACTORS.get(u, (None, 1))[1] == 1.0 \
+            else None
+    if u == b:
+        return value
+    fu, fb = UNIT_FACTORS.get(u), UNIT_FACTORS.get(b)
+    if fu is None:
+        # 未登记单位：仅与同名单位比较（视为同物），不臆断量纲
+        return None
+    if fu[0] != fb[0]:
+        return None              # 跨族（如电流通道报 Pa）不可换算
+    return value * fu[1] / fb[1]
 
 
 # ---------------------------------------------------------------- 复核引擎
@@ -152,11 +209,356 @@ def evaluate(p):
         out.update(extra)
         return out
 
+    # ---------------------------------------------------- 响应佐证引擎
+    # 离散反馈只证明“触点动作了”，不证明设备真动。evidence 把反馈与电流、
+    # 风压、阀位等模拟量采样绑定到同一触发实例：每路佐证在反馈后的采样窗口
+    # 内取值，换算到有效范围单位，须持续在范围内至少 duration_ms；采样间隔
+    # 超过 missing_ms 为断档。各源结论 support/contradict/unknown，再按
+    # all/any/k_of_n 汇总，返回采用样本与最早分歧区间。
+    def normalize_evidence(ev):
+        """归一化 evidence 段；结构非法 -> ({'invalid': [...]}, None)。"""
+        if not isinstance(ev, dict):
+            return {"invalid": [{"member": "evidence",
+                                 "reason": "invalid_evidence"}]}, None
+        bad = []
+
+        def int_field(d, key, tag, default=None, allow_none=True):
+            if d.get(key) is None:
+                if default is not None or allow_none:
+                    return default
+                bad.append({"member": tag, "reason": "invalid_evidence"})
+                return None
+            try:
+                v = d[key]
+                if isinstance(v, bool):
+                    raise ValueError
+                v = int(v)
+                if v < 0:
+                    raise ValueError
+                return v
+            except (TypeError, ValueError):
+                bad.append({"member": tag, "reason": "invalid_evidence",
+                            "detail": {key: d.get(key)}})
+                return None
+
+        def range_of(spec, tag):
+            r = spec.get("range")
+            if not isinstance(r, dict):
+                bad.append({"member": tag, "reason": "invalid_evidence_range"})
+                return None
+            mn, mx = r.get("min"), r.get("max")
+            for v0 in (mn, mx):
+                if v0 is not None and (
+                        isinstance(v0, bool)
+                        or not isinstance(v0, numbers.Real)):
+                    bad.append({"member": tag,
+                                "reason": "invalid_evidence_range"})
+                    return None
+            if mn is not None and mx is not None and mn > mx:
+                bad.append({"member": tag,
+                            "reason": "invalid_evidence_range"})
+                return None
+            return {"min": mn, "max": mx,
+                    "unit": (r.get("unit") or None)}
+
+        def_window = int_field(ev, "window_ms", "evidence:window_ms",
+                               allow_none=True)
+        def_duration = int_field(ev, "duration_ms", "evidence:duration_ms",
+                                 default=0)
+        def_missing = int_field(ev, "missing_ms", "evidence:missing_ms",
+                                allow_none=True)
+        def_range = range_of(ev, "evidence:range") if ev.get("range") else None
+
+        combine = ev.get("combine", "all")
+        if combine not in ("all", "any", "k_of_n"):
+            bad.append({"member": "evidence:combine",
+                        "reason": "invalid_evidence",
+                        "detail": {"combine": combine}})
+        k = None
+        if combine == "k_of_n":
+            kv = ev.get("k")
+            if isinstance(kv, bool) or not isinstance(kv, int):
+                bad.append({"member": "evidence:k",
+                            "reason": "invalid_evidence",
+                            "detail": {"k": kv}})
+            else:
+                k = kv
+            # k 范围要等源数确定后再核
+
+        raw_sources = ev.get("sources")
+        if not isinstance(raw_sources, list) or not raw_sources:
+            bad.append({"member": "evidence:sources",
+                        "reason": "invalid_evidence"})
+            raw_sources = []
+        sources = []
+        tokens = set()
+        for i, s0 in enumerate(raw_sources):
+            if isinstance(s0, str):
+                ds = s0.split(":", 1)
+                if len(ds) != 2:
+                    bad.append({"member": f"evidence:sources[{i}]",
+                                "reason": "invalid_evidence"})
+                    continue
+                s0 = {"device": ds[0], "signal": ds[1]}
+            if not isinstance(s0, dict) or not s0.get("signal") \
+                    or not s0.get("device"):
+                bad.append({"member": f"evidence:sources[{i}]",
+                            "reason": "invalid_evidence"})
+                continue
+            tag = f"evidence:sources[{i}]"
+            win = int_field(s0, "window_ms", f"{tag}:window_ms",
+                            default=def_window, allow_none=True)
+            dur = int_field(s0, "duration_ms", f"{tag}:duration_ms",
+                            default=def_duration)
+            mis = int_field(s0, "missing_ms", f"{tag}:missing_ms",
+                            default=def_missing, allow_none=True)
+            rng = range_of(s0, f"{tag}:range") if s0.get("range") else def_range
+            if rng is None:
+                bad.append({"member": tag, "reason": "invalid_evidence_range"})
+                continue
+            if win is None:
+                bad.append({"member": tag, "reason": "invalid_evidence"})
+                continue
+            tok = f"{s0.get('device')}:{s0['signal']}"
+            if tok in tokens:
+                bad.append({"member": tag, "reason": "duplicate_evidence_source",
+                            "detail": tok})
+                continue
+            tokens.add(tok)
+            sources.append({"spec_device": s0.get("device"),
+                            "signal": s0["signal"], "window_ms": win,
+                            "duration_ms": dur, "missing_ms": mis,
+                            "range": rng})
+        if combine == "k_of_n":
+            if not bad and not (isinstance(k, int)
+                                and 1 <= k <= len(sources)):
+                bad.append({"member": "evidence:k",
+                            "reason": "k_out_of_range",
+                            "detail": {"k": k, "n": len(sources)}})
+        if bad:
+            return {"invalid": bad}, None
+
+        out_sources = []
+        for s in sources:
+            d, err = resolve(s["spec_device"])
+            if err:
+                bad.append({"member": f"{s['spec_device']}:{s['signal']}",
+                            "reason": err})
+                continue
+            out_sources.append({**s, "device": d})
+        if bad:
+            return {"invalid": bad}, None
+        return {"combine": combine, "k": k, "sources": out_sources}, True
+
+    def eval_evidence(norm, fb_ts, cap):
+        """反馈事件于 fb_ts 成立后，评估绑定本触发实例的佐证组合。
+        返回 {status, combine, k, sources:[...], samples:[...]}；
+        status ∈ support / contradict / unknown。"""
+        def eval_source(s):
+            dev, sig = s["device"], s["signal"]
+            tag = f"{dev}:{sig}"
+            ent = {"source": tag, "device": dev, "signal": sig,
+                   "window_ms": s["window_ms"], "duration_ms": s["duration_ms"],
+                   "missing_ms": s["missing_ms"], "range": s["range"],
+                   "status": "unknown", "reason": None,
+                   "adopted_samples": [], "divergence": None}
+            d, err = resolve(dev)
+            if err:
+                ent["reason"] = err
+                return ent
+            if d in untrusted:
+                ent["reason"] = "clock_residual_out_of_bounds"
+                return ent
+            win_close = fb_ts + s["window_ms"]
+            hi = win_close
+            window_open = True
+            if cap is not None and fb_ts < cap < hi:
+                hi = cap            # 全局复位截断佐证窗口，不得跨轮取证
+                window_open = False
+            g = gap_between(d, fb_ts, hi)
+            if g:
+                ent["reason"] = "log_gap"
+                ent["gap"] = g
+                return ent
+            stream = sorted(by_dev.get(d, []),
+                            key=lambda e: (e["ts"], e.get("seq") or 0))
+            same = [e for e in stream if e["signal"] == sig]
+            inwin = [e for e in same if fb_ts <= e["ts"] <= hi]
+            base_unit = s["range"]["unit"]
+            samples = []
+            convert_fail = None
+            for e in inwin:
+                v = e.get("value")
+                if isinstance(v, bool) or not isinstance(v, numbers.Real):
+                    convert_fail = "evidence_value_not_numeric"
+                    break
+                cv = convert_unit(float(v), e.get("unit"), base_unit)
+                if cv is None:
+                    convert_fail = "unit_not_convertible"
+                    break
+                mn, mx = s["range"]["min"], s["range"]["max"]
+                inside = (mn is None or cv >= mn) and (mx is None or cv <= mx)
+                samples.append({"device": dev, "signal": sig,
+                                "seq": e.get("seq"), "ts": e["ts"],
+                                "value": v, "unit": e.get("unit"),
+                                "converted_value": cv,
+                                "range_unit": base_unit, "in_range": inside})
+            # 单位无法换算 / 无数值：无法判定，保持 unknown（优先于其他嫌疑）
+            if convert_fail:
+                ent["reason"] = convert_fail
+                ent["adopted_samples"] = samples
+                return ent
+
+            # ---- 连续段划分（在范围/越界）----
+            def find_run(want):
+                run = None
+                for sm in samples:
+                    if sm["in_range"] == want:
+                        if run is None:
+                            run = {"start": sm["ts"], "end": sm["ts"],
+                                   "samples": [sm]}
+                        else:
+                            run["end"] = sm["ts"]
+                            run["samples"].append(sm)
+                    elif run is not None:
+                        yield run
+                        run = None
+                if run is not None:
+                    yield run
+
+            in_runs = list(find_run(True))
+            out_runs = list(find_run(False))
+
+            def later_in_range(run):
+                return next((sm["ts"] for sm in samples
+                             if sm["ts"] >= run["end"] and sm["in_range"]),
+                            None)
+
+            # ---- 相斥优先：越界段覆盖到下一个在范围样本或窗口末端，时长
+            #      达到 duration 即判相斥；其后的末端缺测不能洗清“信号到了
+            #      设备没动”。内部采样断档同理不阻断相斥，只记录在案。----
+            contradiction = None
+            for run in out_runs:
+                end_bound = later_in_range(run)
+                if end_bound is None:
+                    # 越界一直持续到最后一个越界观测；之后即便缺测也按
+                    # 已观测越界覆盖到 hi 折算（hi 前无任何在范围反证）
+                    end_bound = hi
+                if end_bound - run["start"] >= s["duration_ms"]:
+                    contradiction = run
+                    contradiction["end_bound"] = end_bound
+                    break
+            if contradiction is not None:
+                ent["status"] = "contradict"
+                ent["reason"] = "evidence_out_of_range"
+                ent["adopted_samples"] = samples
+                ent["divergence"] = {
+                    "from_ts": contradiction["start"],
+                    "to_ts": contradiction["end_bound"],
+                    "range": s["range"],
+                    "samples": contradiction["samples"]}
+                return ent
+
+            # ---- 采样断档：仅指“两条已有记录之间间隔超 missing_ms”——
+            #      起点到首样本、相邻样本之间、末样本到其后下一条同信号
+            #      记录（缺测可能藏反证）。敞开窗口末端尚无下一条记录，或
+            #      窗口被全局复位截断，都不算断档，归证据不足/window_open。----
+            missing = s["missing_ms"]
+            gap_seg = None
+            if missing is not None:
+                def too_long(a, b):
+                    return b - a > missing
+                if inwin:
+                    first, last = inwin[0], inwin[-1]
+                    if too_long(fb_ts, first["ts"]):
+                        gap_seg = [fb_ts, first["ts"]]
+                    if gap_seg is None:
+                        for a, b in zip(inwin, inwin[1:]):
+                            if too_long(a["ts"], b["ts"]):
+                                gap_seg = [a["ts"], b["ts"]]
+                                break
+                    if gap_seg is None:
+                        nxt = next((e for e in same if e["ts"] > last["ts"]),
+                                   None)
+                        # 下一条记录落在窗口外也仍证明“末样本之后确实断档”
+                        if nxt is not None and too_long(last["ts"], nxt["ts"]):
+                            gap_seg = [last["ts"], nxt["ts"]]
+                else:
+                    nxt = next((e for e in same if e["ts"] > fb_ts), None)
+                    if nxt is not None and too_long(fb_ts, nxt["ts"]):
+                        gap_seg = [fb_ts, nxt["ts"]]
+            if gap_seg:
+                ent["reason"] = "evidence_sample_gap"
+                ent["adopted_samples"] = samples
+                ent["gap_segment_ms"] = gap_seg
+                return ent
+
+            # ---- 支持：在范围段从首个在范围样本起，观测到下一个越界样本
+            #      （此前持续在范围）或最后一个在范围样本，持续达到
+            #      duration_ms；窗口闭合（全局复位截断）时还可用覆盖到 hi
+            #      的折算时长。敞开窗口覆盖不到末端 -> window_open。----
+            def run_observed_span(r):
+                end_obs = next((sm["ts"] for sm in samples
+                                if sm["ts"] > r["end"]
+                                and not sm["in_range"]), None)
+                if end_obs is None:
+                    end_obs = r["end"] if window_open else hi
+                return end_obs - r["start"]
+
+            good = next((r for r in in_runs
+                         if run_observed_span(r) >= s["duration_ms"]), None)
+            ent["adopted_samples"] = samples
+            if good is not None:
+                ent["status"] = "support"
+                return ent
+            # 窗口已闭合仍找不到持续在范围的佐证 -> 证据不足（不是相斥）；
+            # 窗口敞开（无全局复位截断且采样未覆盖到窗口末端）-> window_open
+            ent["reason"] = ("evidence_window_open" if window_open
+                             else "evidence_insufficient")
+            return ent
+
+        src_out = [eval_source(s) for s in norm["sources"]]
+        supported = [s for s in src_out if s["status"] == "support"]
+        contrad = [s for s in src_out if s["status"] == "contradict"]
+        combine, k = norm["combine"], norm["k"]
+        need = len(src_out) if combine == "all" else 1 if combine == "any" else k
+        if contrad:
+            status = "contradict"
+        elif len(supported) >= need:
+            status = "support"
+        else:
+            status = "unknown"
+        # 最早分歧区间：相斥源中起始时刻最早者
+        divs = [s["divergence"] for s in contrad if s.get("divergence")]
+        divergence = min(divs, key=lambda d: d["from_ts"]) if divs else None
+        samples_all = [sm for s in src_out for sm in s["adopted_samples"]]
+        samples_all.sort(key=lambda x: (x["ts"], x["device"]))
+        return {"status": status, "combine": combine, "k": k,
+                "sources": src_out, "samples": samples_all,
+                "divergence": divergence}
+
+    _evidence_cache = {}
+
+    def evidence_for(resp):
+        """归一化（并缓存）某 respond 的佐证规则；未声明 -> None。"""
+        if "evidence" not in resp:
+            return None
+        key = id(resp)
+        if key not in _evidence_cache:
+            _evidence_cache[key] = normalize_evidence(resp["evidence"])
+        return _evidence_cache[key]
+
     def check_resp(t0, resp, rule, cap=None):
         name, sig = resp["device"], resp["signal"]
         head = (rule.get("trigger") or {}).get("device", "composite")
         chain = [head] + list(resp.get("after", [])) + [f"{name}:{sig}"]
         base = {"type": "response", "target": f"{name}:{sig}", "upstream": chain}
+        ev_spec = evidence_for(resp)
+        if ev_spec is not None and ev_spec[1] is None:
+            return {**base, "status": "unknown",
+                    "reason": "invalid_evidence",
+                    "evidence": {"rule": ev_spec[0], "status": "unknown",
+                                 "sources": [], "samples": []}}
         d, err = resolve(name)
         if err:
             return {**base, "status": "unknown", "reason": err}
@@ -199,7 +601,24 @@ def evaluate(p):
             if not deps:
                 return {**base, "status": "fail", "type": "out_of_order",
                         "actual": ev["ts"], "missing_predecessor": dep}
-        return {**base, "status": "ok", "actual": ev["ts"], "elapsed_ms": ev["ts"] - t0}
+        out = {**base, "status": "ok", "actual": ev["ts"],
+               "elapsed_ms": ev["ts"] - t0}
+        if ev_spec is not None:
+            norm = ev_spec[0]
+            er = eval_evidence(norm, ev["ts"], cap)
+            block = {"status": er["status"], "rule": norm,
+                     "combine": er["combine"],
+                     "sources": er["sources"], "samples": er["samples"]}
+            if er.get("divergence"):
+                block["divergence"] = er["divergence"]
+            out["evidence"] = block
+            if er["status"] == "contradict":
+                out.update(status="fail",
+                           evidence_type="evidence_contradiction",
+                           reason="evidence_out_of_range")
+            elif er["status"] == "unknown":
+                out.update(status="unknown", reason="evidence_inconclusive")
+        return out
 
     # ---------------------------------------------------- 复合触发引擎
     # 一个“触发实例”= 一轮火警。确认 = 组合在 window_ms 窗口内凑齐（
@@ -869,8 +1288,20 @@ def evaluate(p):
         return normalized, raw
 
     # ---- 逐场景回放 ----
+    def evidence_plan(rule):
+        """固定本规则各 respond 的归一化佐证规则进重放 JSON。"""
+        out = []
+        for resp in rule.get("respond", []) or []:
+            if "evidence" not in resp:
+                continue
+            norm, valid = evidence_for(resp)
+            out.append({"target": f"{resp['device']}:{resp['signal']}",
+                        "valid": bool(valid), "rule": norm})
+        return out
+
     scenarios = []
     for rule in p.get("matrix", []) or []:
+        plan = evidence_plan(rule)
         if "composite" in rule:
             normalized, raw = eval_composite_rule(rule)
             if raw is None:  # 结构非法（别名多解/循环/k 越界/端点非法）
@@ -911,8 +1342,11 @@ def evaluate(p):
                      else "unknown"
                      if any(i["status"] == "unknown" for i in instances)
                      else "pass")
-            scenarios.append({"id": rule.get("id"), "status": sc_st,
-                              "composite": normalized, "instances": instances})
+            sc_obj = {"id": rule.get("id"), "status": sc_st,
+                      "composite": normalized, "instances": instances}
+            if plan:
+                sc_obj["evidence_rules"] = plan
+            scenarios.append(sc_obj)
             continue
 
         trig = rule["trigger"]
@@ -959,7 +1393,10 @@ def evaluate(p):
         sc_st = ("fail" if any(i["status"] == "fail" for i in instances)
                  else "unknown" if any(i["status"] == "unknown" for i in instances)
                  else "pass")
-        scenarios.append({"id": rule.get("id"), "status": sc_st, "instances": instances})
+        sc_obj = {"id": rule.get("id"), "status": sc_st, "instances": instances}
+        if plan:
+            sc_obj["evidence_rules"] = plan
+        scenarios.append(sc_obj)
 
 
     # ---- 恢复顺序校核（火警解除 -> 人工复位 -> 设备回位 -> 锁存确认）----
@@ -2046,6 +2483,73 @@ def verdict_changes(ra, rb):
             for k in sorted(set(sa) | set(sb)) if sa.get(k) != sb.get(k)]
 
 
+def evidence_rule_canonical(rule):
+    """归一化佐证规则的稳定投影：剔除解析期附带字段，仅留可比较的语义。"""
+    if not isinstance(rule, dict):
+        return rule
+    if "invalid" in rule:
+        return {"invalid": rule["invalid"]}
+    return {"combine": rule.get("combine"), "k": rule.get("k"),
+            "sources": [{"device": s.get("device", s.get("spec_device")),
+                         "signal": s.get("signal"),
+                         "window_ms": s.get("window_ms"),
+                         "duration_ms": s.get("duration_ms"),
+                         "missing_ms": s.get("missing_ms"),
+                         "range": s.get("range")}
+                        for s in rule.get("sources", [])]}
+
+
+def evidence_changes(ra, rb):
+    """对比两版结果中每个 respond 的佐证：规则版本与结论差异。
+    旧版未声明 evidence 的 respond 不列出（保持原结果即可）。"""
+    def index(result):
+        out = {}
+        for sc in result.get("scenarios", []):
+            rules = {e["target"]: e for e in sc.get("evidence_rules", [])}
+            for inst in sc.get("instances", []):
+                for f in inst.get("findings", []):
+                    if f.get("type") == "response" and "evidence" in f:
+                        plan = rules.get(f["target"])
+                        if plan is None:
+                            # 旧版重放：规则固定在 finding 内
+                            plan = {"target": f["target"], "valid": True,
+                                    "rule": f["evidence"].get("rule")}
+                        out[(sc["id"], inst.get("trigger_ts"),
+                             f["target"])] = {
+                            "rule": evidence_rule_canonical(
+                                plan.get("rule")),
+                            "status": f["evidence"]["status"],
+                            "verdict": f["status"],
+                            "reason": f.get("reason")}
+        return out
+    ia, ib = index(ra), index(rb)
+    changes = []
+    for k in sorted(set(ia) | set(ib)):
+        a, b = ia.get(k), ib.get(k)
+        if a == b:
+            continue
+        item = {"scenario": k[0], "trigger_ts": k[1], "target": k[2]}
+        if a is None:
+            item["op"] = "add"
+            item["to"] = b
+        elif b is None:
+            item["op"] = "remove"
+            item["from"] = a
+        else:
+            item["op"] = "replace"
+            if a["rule"] != b["rule"]:
+                item["rule_changed"] = True
+                item["rule_from"] = a["rule"]
+                item["rule_to"] = b["rule"]
+            if a["status"] != b["status"] or a["verdict"] != b["verdict"]:
+                item["verdict_from"] = {"evidence": a["status"],
+                                        "response": a["verdict"]}
+                item["verdict_to"] = {"evidence": b["status"],
+                                      "response": b["verdict"]}
+        changes.append(item)
+    return changes
+
+
 # ---------------------------------------------------------------- HTTP 层
 
 REASONS = {200: "OK", 201: "Created", 400: "Bad Request",
@@ -2108,8 +2612,8 @@ def make_app(db_path):
             return 409, {"error": "已签结，矩阵/事件/别名映射已冻结，拒绝新修订"}
         just = (body.get("justification") or "").strip()
         if not just:
-            return 400, {"error": "重绑设备、改时钟锚点或改触发/复合规则"
-                                 "必须给出 justification 依据"}
+            return 400, {"error": "重绑设备、改时钟锚点、改触发/复合规则或"
+                                 "改响应佐证规则必须给出 justification 依据"}
         cur = conn.execute("SELECT MAX(rev) FROM revisions WHERE project=?",
                            (pid,)).fetchone()[0]
         base = get_rev(conn, pid, cur)["payload"]
@@ -2176,6 +2680,7 @@ def make_app(db_path):
             "project": pid, "from": a, "to": b,
             "payload_changes": diff_json(ra["payload"], rb["payload"]),
             "verdict_changes": verdict_changes(ra["result"], rb["result"]),
+            "evidence_changes": evidence_changes(ra["result"], rb["result"]),
             "justification": rb["justification"]}
 
     def app(environ, start_response):

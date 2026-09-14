@@ -6,6 +6,9 @@
   3. seq 缺口可能遗漏 bypass_off -> 旁路 unknown，不判 bypass_not_reset/fail
   4. mutex / bypass finding 均带 upstream
   5. 既有三组模拟行为不变；修订/重放/差异/签结流程不变
+  6. 响应佐证：粘连触点（离散反馈到、电流为 0）判 fail 并给分歧区间；
+     单位同族换算、跨族不可换算；采样断档/日志缺号/窗口证据不足 unknown；
+     all/any/k_of_n 汇总；旧 respond 与修订固化（规则/样本/结论可还原）
 运行:  python3 test_regression.py
 """
 import json
@@ -307,6 +310,48 @@ class LifecycleHttpTest(unittest.TestCase):
         code, _ = self.call("POST", f"/projects/{pid}/revisions",
                             {"justification": "签结后再改", "patch": {}})
         self.assertEqual(code, 409)
+
+
+    def test_evidence_revision_pinned_and_diff(self):
+        # rev1：触点粘连 -> fail；修订佐证规则+重采样本 -> pass；
+        # 旧版重放仍 fail（规则/样本/分歧区间固定），diff 列出规则变化。
+        from simulate import CONTACT_STUCK, CONTACT_HEALTHY
+        code, o = self.call("POST", "/projects", CONTACT_STUCK)
+        self.assertEqual((code, o["status"]), (201, "fail"))
+        pid = o["project"]
+        # 缺 justification -> 400
+        code, _ = self.call("POST", f"/projects/{pid}/revisions",
+                            {"payload": CONTACT_HEALTHY})
+        self.assertEqual(code, 400)
+        # 附依据修订佐证规则与样本 -> rev2 pass
+        code, o = self.call("POST", f"/projects/{pid}/revisions",
+                            {"justification": "换表并加装风压测点，佐证改 any",
+                             "payload": CONTACT_HEALTHY})
+        self.assertEqual((code, o["rev"], o["status"]), (201, 2, "pass"))
+        # 旧版重放：规则/样本/结论原样还原
+        code, o = self.call("GET", f"/projects/{pid}/revisions/1")
+        f = (o["replay"]["scenarios"][0]["instances"][0]
+             ["findings"][0])
+        self.assertEqual(f["status"], "fail")
+        self.assertEqual(f["evidence"]["combine"], "all")
+        self.assertEqual(f["evidence"]["divergence"]["from_ts"], 2200)
+        # 新版
+        code, o = self.call("GET", f"/projects/{pid}/revisions/2")
+        f = (o["replay"]["scenarios"][0]["instances"][0]
+             ["findings"][0])
+        self.assertEqual(f["status"], "ok")
+        self.assertEqual(f["evidence"]["combine"], "any")
+        # diff：结论翻转 + 佐证规则变化
+        code, o = self.call("GET", f"/projects/{pid}/diff?from=1&to=2")
+        self.assertEqual(o["verdict_changes"],
+                         [{"scenario": "S4-排烟风机",
+                           "from": "fail", "to": "pass"}])
+        ch = o["evidence_changes"][0]
+        self.assertTrue(ch["rule_changed"])
+        self.assertEqual(ch["verdict_from"],
+                         {"evidence": "contradict", "response": "fail"})
+        self.assertEqual(ch["verdict_to"],
+                         {"evidence": "support", "response": "ok"})
 
 
 def composite_payload(**kw):
@@ -672,6 +717,304 @@ class CompositeStructureTest(unittest.TestCase):
         self.assertEqual(
             sorted((n["device"], n["signal"]) for n in comp["root"]["k_of_n"]),
             [("D1", "alarm"), ("D2", "alarm")])
+
+
+def evidence_payload(events, evidence, **kw):
+    """佐证载荷：D1 报警 -> F1 start 反馈；I1 电流 / P1 风压 / V1 阀位。"""
+    p = base_payload(
+        devices={"D1": {"type": "smoke"}, "F1": {"type": "fan"},
+                 "I1": {"type": "ammeter"}, "P1": {"type": "pressure"},
+                 "V1": {"type": "valve"}, "P9": {"type": "panel"}},
+        matrix=[{"id": "S",
+                 "trigger": {"device": "D1", "signal": "alarm"},
+                 "respond": [{"device": "F1", "signal": "start",
+                              "within_ms": 60000, "evidence": evidence}]}],
+        sync_pulses=[{"device": d, "device_ts": 0, "master_ts": 0}
+                     for d in ("D1", "F1", "I1", "P1", "V1", "P9")],
+        events=events)
+    p.update(kw)
+    return p
+
+
+def smp(dev, sig, ts, seq, value, unit=None):
+    e = {"device": dev, "seq": seq, "signal": sig, "device_ts": ts,
+         "value": value}
+    if unit:
+        e["unit"] = unit
+    return e
+
+
+FB_EVENTS = [
+    {"device": "D1", "seq": 1, "signal": "alarm", "device_ts": 1000},
+    {"device": "F1", "seq": 1, "signal": "start", "device_ts": 2000}]
+CUR_RANGE = {"min": 5, "max": 20, "unit": "A"}
+
+
+def cur_evidence(**over):
+    ev = {"window_ms": 5000, "range": CUR_RANGE, "duration_ms": 1000,
+          "missing_ms": 2000,
+          "sources": [{"device": "I1", "signal": "I"}]}
+    ev.update(over)
+    return ev
+
+
+def evidence_finding(result):
+    return result["scenarios"][0]["instances"][0]["findings"][0]
+
+
+class ResponseEvidenceTest(unittest.TestCase):
+    """响应佐证：离散反馈须与电流/风压/阀位等模拟量证据一致。"""
+
+    def test_stuck_contact_zero_current_fails(self):
+        # 触点粘连：start 已上报但电流始终 0A -> fail，给分歧区间
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 0.1, "A"),
+            smp("I1", "I", 4000, 2, 0.0, "A"),
+            smp("I1", "I", 7000, 3, 0.0, "A")], cur_evidence()))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "fail")
+        self.assertEqual(f["type"], "response")
+        self.assertEqual(f["evidence_type"], "evidence_contradiction")
+        self.assertEqual(f["evidence"]["status"], "contradict")
+        self.assertEqual(f["evidence"]["sources"][0]["status"], "contradict")
+        d = f["evidence"]["divergence"]
+        self.assertEqual(d["from_ts"], 2200)
+        self.assertEqual(d["to_ts"], 7000)
+        self.assertEqual(r["status"], "fail")
+
+    def test_healthy_current_passes_with_samples(self):
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 0.2, "A"),    # 启动爬升，短暂越界不判
+            smp("I1", "I", 2600, 2, 8.0, "A"),
+            smp("I1", "I", 3200, 3, 8.1, "A"),
+            smp("I1", "I", 4000, 4, 7.9, "A"),
+            smp("I1", "I", 5000, 5, 8.0, "A")], cur_evidence()))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "ok")
+        self.assertEqual(f["evidence"]["status"], "support")
+        self.assertTrue(all({"ts", "value", "converted_value", "in_range"}
+                            <= set(s) for s in f["evidence"]["samples"]))
+        self.assertEqual(r["status"], "pass")
+
+    def test_unit_conversion_ma_to_a(self):
+        # 电流以 mA 上报、范围以 A 声明：同族换算后判定
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2100, 1, 200, "mA"),    # 0.2 A，越界
+            smp("I1", "I", 3000, 2, 8000, "mA"),
+            smp("I1", "I", 4000, 3, 8000, "mA")], cur_evidence()))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "ok")
+        first = f["evidence"]["samples"][0]
+        self.assertAlmostEqual(first["converted_value"], 0.2)
+        self.assertFalse(first["in_range"])
+
+    def test_pressure_units_pa_kpa_bar(self):
+        ev = cur_evidence(range={"min": 300, "max": 800, "unit": "Pa"},
+                          sources=[{"device": "P1", "signal": "W"}])
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("P1", "W", 2500, 1, 0.5, "kPa"),   # 500 Pa
+            smp("P1", "W", 3500, 2, 5.0, "mbar"),  # 500 Pa
+            smp("P1", "W", 4500, 3, 500, "Pa")], ev))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "ok")
+        self.assertTrue(all(s["in_range"]
+                            for s in f["evidence"]["samples"]))
+
+    def test_cross_family_unit_inconclusive(self):
+        # 电流通道上报 Pa：跨族无法换算 -> unknown，不判 fail
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "Pa"),
+            smp("I1", "I", 4000, 2, 8.0, "Pa")], cur_evidence()))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["reason"], "evidence_inconclusive")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"],
+                         "unit_not_convertible")
+        self.assertEqual(r["status"], "unknown")
+
+    def test_sample_gap_unknown(self):
+        # 两点间隔 4000ms > 缺测容限 2000ms -> 采样断档 unknown
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 6500, 2, 8.0, "A")],
+            cur_evidence(window_ms=6000)))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"],
+                         "evidence_sample_gap")
+        self.assertEqual(
+            f["evidence"]["sources"][0]["gap_segment_ms"], [2500, 6500])
+
+    def test_log_gap_unknown(self):
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 4, 8.0, "A")], cur_evidence()))  # 缺 seq 2,3
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"], "log_gap")
+
+    def test_open_window_insufficient_unknown(self):
+        # 敞开窗口内只覆盖 200ms，达不到 duration -> unknown(window_open)
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 8.0, "A"),
+            smp("I1", "I", 2400, 2, 8.0, "A")],
+            cur_evidence(missing_ms=3000)))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"],
+                         "evidence_window_open")
+
+    def test_all_any_k_of_n_combines(self):
+        src = [
+            {"device": "I1", "signal": "I", "range": CUR_RANGE},
+            {"device": "P1", "signal": "W",
+             "range": {"min": 300, "max": 800, "unit": "Pa"}},
+            {"device": "V1", "signal": "POS",
+             "range": {"min": 90, "max": 100, "unit": "%"}}]
+        events = FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 2, 8.0, "A"),
+            smp("P1", "W", 2500, 1, 500, "Pa"),
+            smp("P1", "W", 4000, 2, 500, "Pa"),
+            smp("V1", "POS", 2500, 1, 10, "%"),   # 阀位相斥
+            smp("V1", "POS", 4000, 2, 10, "%")]
+        # all：任一相斥即 fail
+        r = evaluate(evidence_payload(
+            events, cur_evidence(combine="all", sources=src)))
+        self.assertEqual(evidence_finding(r)["status"], "fail")
+        # k_of_n(2)：两支持一相斥，相斥仍优先 -> fail
+        r = evaluate(evidence_payload(
+            events, cur_evidence(combine="k_of_n", k=2, sources=src)))
+        self.assertEqual(evidence_finding(r)["status"], "fail")
+        # any + 去掉阀位源：一支持即 pass（风压未知设备删除）
+        r = evaluate(evidence_payload(
+            FB_EVENTS + [
+                smp("I1", "I", 2200, 1, 8.0, "A"),
+                smp("I1", "I", 4000, 2, 8.0, "A")],
+            cur_evidence(combine="any", sources=[src[0]])))
+        self.assertEqual(evidence_finding(r)["status"], "ok")
+
+    def test_k_of_n_two_support_one_unknown(self):
+        src = [
+            {"device": "I1", "signal": "I", "range": CUR_RANGE},
+            {"device": "P1", "signal": "W",
+             "range": {"min": 300, "max": 800, "unit": "Pa"}},
+            {"device": "V1", "signal": "POS",
+             "range": {"min": 90, "max": 100, "unit": "%"}}]
+        events = FB_EVENTS + [
+            smp("I1", "I", 2200, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 2, 8.0, "A"),
+            smp("P1", "W", 2500, 1, 500, "Pa"),
+            smp("P1", "W", 4000, 2, 500, "Pa")]   # V1 无样本 -> unknown
+        r = evaluate(evidence_payload(
+            events, cur_evidence(combine="k_of_n", k=2,
+                                 missing_ms=3000, sources=src)))
+        self.assertEqual(evidence_finding(r)["status"], "ok")
+
+    def test_per_source_overrides_defaults(self):
+        # 顶层缺省 + 源级覆盖窗口：源窗口 2200..4200 被复位 3000 截断为
+        # 2200..3000，唯一样本 2500 距起点仅 300ms -> 闭合窗口证据不足
+        comp = {"all": [{"device": "D1", "signal": "alarm"}],
+                "window_ms": 30000, "hold_ms": 0,
+                "reset": {"device": "P9", "signal": "reset"}}
+        ev = {"window_ms": 5000, "duration_ms": 1000, "missing_ms": 2000,
+              "range": CUR_RANGE,
+              "sources": [{"device": "I1", "signal": "I",
+                           "window_ms": 2200}]}
+        p = evidence_payload(FB_EVENTS + [
+            cev("P9", "reset", 3000),
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 4500, 2, 8.0, "A")], ev)
+        p["matrix"][0]["composite"] = comp
+        del p["matrix"][0]["trigger"]
+        r = evaluate(p)
+        f = r["scenarios"][0]["instances"][0]["findings"][0]
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"],
+                         "evidence_insufficient")
+
+    def test_shorthand_string_source(self):
+        ev = cur_evidence(sources=["I1:I"])
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 2, 8.0, "A")], ev))
+        self.assertEqual(evidence_finding(r)["status"], "ok")
+
+    def test_invalid_evidence_structure_unknown(self):
+        r = evaluate(evidence_payload(FB_EVENTS, {"sources": []}))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["reason"], "invalid_evidence")
+        self.assertTrue(f["evidence"]["rule"]["invalid"])
+
+    def test_k_out_of_range_unknown(self):
+        ev = cur_evidence(combine="k_of_n", k=3,
+                          sources=[{"device": "I1", "signal": "I"}])
+        r = evaluate(evidence_payload(FB_EVENTS, ev))
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertTrue(any(g["reason"] == "k_out_of_range"
+                            for g in f["evidence"]["rule"]["invalid"]))
+
+    def test_untrusted_evidence_clock_unknown(self):
+        p = evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 2, 8.0, "A")], cur_evidence())
+        p["sync_pulses"] = [
+            {"device": "D1", "device_ts": 0, "master_ts": 0},
+            {"device": "F1", "device_ts": 0, "master_ts": 0},
+            {"device": "I1", "device_ts": 0, "master_ts": 0},
+            {"device": "I1", "device_ts": 100000, "master_ts": 100500}]
+        r = evaluate(p)
+        f = evidence_finding(r)
+        self.assertEqual(f["status"], "unknown")
+        self.assertEqual(f["evidence"]["sources"][0]["reason"],
+                         "clock_residual_out_of_bounds")
+
+    def test_normalized_rule_pinned_in_replay(self):
+        r = evaluate(evidence_payload(FB_EVENTS + [
+            smp("I1", "I", 2500, 1, 8.0, "A"),
+            smp("I1", "I", 4000, 2, 8.0, "A")],
+            cur_evidence(sources=["I1:I"])))
+        plan = r["scenarios"][0]["evidence_rules"][0]
+        self.assertEqual(plan["target"], "F1:start")
+        self.assertTrue(plan["valid"])
+        self.assertEqual(plan["rule"]["sources"][0]["device"], "I1")
+
+    def test_evidence_bound_to_trigger_round(self):
+        # 复合触发两轮：佐证窗口被全局复位截断，不把下一轮样本挂到本轮
+        devs = {"D1": {"type": "smoke"}, "P9": {"type": "panel"},
+                "F1": {"type": "fan"}, "I1": {"type": "ammeter"}}
+        comp = {"all": [{"device": "D1", "signal": "alarm"}],
+                "window_ms": 30000, "hold_ms": 0,
+                "reset": {"device": "P9", "signal": "reset"}}
+        ev = cur_evidence(window_ms=8000)
+        p = {
+            "devices": devs, "aliases": {},
+            "matrix": [{"id": "C", "composite": comp,
+                        "respond": [{"device": "F1", "signal": "start",
+                                     "within_ms": 60000, "evidence": ev}]}],
+            "sync_pulses": [{"device": d, "device_ts": 0, "master_ts": 0}
+                            for d in devs],
+            "events": [
+                cev("D1", "alarm", 1000), cev("F1", "start", 2000),
+                smp("I1", "I", 2200, 1, 8.0, "A"),
+                cev("P9", "reset", 3000),                # 截断本轮佐证窗口
+                cev("D1", "alarm", 20000, 2),
+                cev("F1", "start", 21000, 2),
+                smp("I1", "I", 21500, 2, 8.0, "A"),
+                smp("I1", "I", 23000, 3, 8.0, "A")]}
+        r = evaluate(p)
+        insts = r["scenarios"][0]["instances"]
+        self.assertEqual([i["trigger_ts"] for i in insts], [1000, 20000])
+        f1, f2 = (i["findings"][0] for i in insts)
+        # 第一轮窗口在 3000 截断：2200 一个在范围样本，下一条同信号记录
+        # 在 21500（间隔远超缺测容限）-> 采样断档 unknown，不把下一轮样本
+        # 拿来给本轮作证；第二轮样本齐 -> ok
+        self.assertEqual(f1["status"], "unknown")
+        self.assertEqual(f1["evidence"]["sources"][0]["reason"],
+                         "evidence_sample_gap")
+        self.assertEqual(f2["status"], "ok")
 
 
 class LegacySingleTriggerCompatTest(unittest.TestCase):
