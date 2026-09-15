@@ -718,16 +718,35 @@ def evaluate(p):
         ep_primary = {"device": td, "signal": resp["signal"]} \
             if not terr else None
         if fo.get("primary") is not None:
+            # 先按原始声明核对主机是否就是本响应（不依赖别名解析），
+            # 解析失败另记别名错误，避免错误被 alias 问题吞掉
+            spec_p = fo.get("primary")
+            if isinstance(spec_p, str):
+                raw_dev, raw_sig = (spec_p.split(":", 1) + [None])[:2] \
+                    if ":" in spec_p else (spec_p, None)
+                raw_tok = spec_p
+            elif isinstance(spec_p, dict):
+                raw_dev, raw_sig = spec_p.get("device"), spec_p.get("signal")
+                raw_tok = f"{raw_dev}:{raw_sig}"
+            else:
+                raw_dev = raw_sig = raw_tok = None
+            resp_tok = f"{resp.get('device')}:{resp.get('signal')}"
+            if not isinstance(spec_p, (str, dict)) or not raw_dev or not raw_sig:
+                bad.append({"member": "failover:primary",
+                            "reason": "invalid_failover"})
+            elif raw_tok != resp_tok:
+                d0, _ = resolve(raw_dev)
+                sig0 = raw_sig
+                resolved = f"{d0}:{sig0}" if d0 else raw_tok
+                if resolved != target_tok:
+                    bad.append({"member": "failover:primary",
+                                "reason": "failover_primary_mismatch",
+                                "detail": raw_tok})
             ep_explicit = parse_fo_endpoint(fo.get("primary"),
                                             "failover:primary", bad)
             if ep_explicit is not None:
                 if f"{ep_explicit['device']}:{ep_explicit['signal']}" \
-                        != target_tok:
-                    bad.append({"member": "failover:primary",
-                                "reason": "failover_primary_mismatch",
-                                "detail": f"{ep_explicit['device']}:"
-                                          f"{ep_explicit['signal']}"})
-                else:
+                        == target_tok:
                     ep_primary = ep_explicit
 
         def ms_field(name):
@@ -2686,18 +2705,8 @@ def evaluate(p):
 
         # ---- 情形 A：总时限内拿到备用启动 ----
         if within_window:
-            g_standby = None
-            if s_ev.get("seq") is not None:
-                p_ev = next((e for e in by_dev.get(pdev, [])
-                             if e["signal"] == psig and e["ts"] >= t0
-                             and (cap is None or e["ts"] < cap)
-                             and (pf is None or pf.get("actual") is None
-                                  or e["ts"] == pf["actual"])), None)
-                lo_seq = p_ev.get("seq") if p_ev else None
-                if lo_seq is not None:
-                    g_standby = next((g for g in gaps.get(sdev, [])
-                                      if g["from_seq"] > lo_seq
-                                      and g["to_seq"] < s_ev["seq"]), None)
+            # 备用设备命令后到启动之间的日志缺口可能藏另一条启动/停止记录
+            g_standby = fo_gap(sdev, t0, s_ts)
             if g_standby:
                 add("unknown", "failover_standby", "log_gap", gap=g_standby,
                     standby=fo_event_ref(s_ev))
@@ -2770,19 +2779,18 @@ def evaluate(p):
                             and pf.get("status") == "ok"
                             and pf.get("actual") is not None
                             and pf["actual"] > s_ts else None)
-            overlap_to = fe_late["ts"] if fe_late is not None \
-                else primary_late if primary_late is not None \
+            # 并行超时只能由“主机在备机启动后仍运行”的证据证明：
+            #   1) 运行佐证显示在范围运行覆盖超过允许并行时长；
+            #   2) 离散主机反馈迟到，且迟到时刻距备启超过允许并行时长。
+            # 切换后才到的故障信号（fe_late）不能证明双机并行——没有主机
+            # 运行反馈或佐证时，并行状态无法坐实，只能按误切换判。
+            overlap_to = primary_late if primary_late is not None \
+                else fe_late["ts"] if fe_late is not None \
                 else s_ts + parallel
             overrun = False
             if verdict == "overrun":
                 overrun = True
-            elif fe_late is not None and verdict != "ended" \
-                    and fe_late["ts"] - s_ts > parallel:
-                overrun = True
-            elif verdict == "no_evidence" and fe_late is not None \
-                    and fe_late["ts"] - s_ts > parallel:
-                overrun = True
-            elif verdict == "no_evidence" and primary_late is not None \
+            elif primary_late is not None and verdict != "ended" \
                     and primary_late - s_ts > parallel:
                 overrun = True
             if overrun:
@@ -2798,21 +2806,20 @@ def evaluate(p):
                     "primary_evidence_pending",
                     standby=fo_event_ref(s_ev))
                 return finish("unknown")
-            if verdict == "no_evidence" and fe_late is None \
-                    and pf is None and cap is None:
-                # 无主机反馈、无故障、敞开窗口：后续可能补来跳闸/反馈，
-                # 不臆断误切换（开关动作已发生，但合法性待证）
+            if verdict == "no_evidence" and pf is None \
+                    and primary_late is None and not ctx.get("closed"):
+                # 无主机运行反馈/佐证，且采集窗口仍敞开：后续可能补来更早
+                # 故障或主机跳闸记录，并行状态与切换合法性均待证，保持
+                # unknown；已观察到的迟到故障（fe_late）同样不能授权
                 add("unknown", "failover_fault", "failover_window_open",
-                    standby=fo_event_ref(s_ev), deadline=deadline)
+                    standby=fo_event_ref(s_ev),
+                    fault=ev_ref(fe_late) if fe_late else None,
+                    deadline=deadline)
                 return finish("unknown")
             # 离散链：主机反馈迟到时长决定并行是否超时；无故障即启备机
-            # 本身即误切换，并行未超时记 spurious_switch
-            if verdict == "no_evidence" and fe_late is None \
-                    and pf is not None and pf.get("status") == "ok" \
-                    and cap is None:
-                # 主机反馈已到但无故障：误切换成立；敞开窗口不影响该判定，
-                # 因为故障须在切换前到达才合法，之后补来已无授权意义
-                pass
+            # 本身即误切换，并行未超时记 spurious_switch。主机反馈已到但
+            # 无故障时敞开窗口不影响该判定——故障须在切换前到达才合法，
+            # 之后补来已无授权意义。
             add("fail", "failover_switch", "spurious_switch",
                 standby=fo_event_ref(s_ev),
                 fault=ev_ref(fe_late) if fe_late else None,
