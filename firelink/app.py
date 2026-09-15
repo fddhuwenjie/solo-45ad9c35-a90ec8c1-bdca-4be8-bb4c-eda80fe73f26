@@ -53,6 +53,28 @@
     佐证相斥的 fail 判定，选择链与采用事件固定进重放 JSON。
   * 规则中不含 failover 段的旧请求演算结果完全不变；规则改动派生修订，
     旧响应保持原判定，diff 给出 failover 规则与结论差异。
+- 控制模式与命令仲裁（control）：设备切到本地检修后联动自动启动仍可能
+  下发，值班员又可能从总线手动停机，仅核对设备反馈分不清当时哪条命令
+  拥有控制权。设备档案 devices[d].control 声明 auto/panel/local 模式与
+  模式切换信号，respond 可声明 control 段：
+  * 矩阵字段：issue/accept/reject（命令下发/接受/拒绝总线端点）、execute
+    （执行反馈，缺省为本响应端点）、commands（受控命令清单，缺省只含
+    本响应 signal）、sources（来源优先级，高 -> 低，缺省
+    auto>panel>local）、authority（各模式授权来源表）、ttl_ms（命令
+    有效期，下发后超期才执行为过期执行）、ack_ms（确认时限，接受后
+    超期无终态为确认超时）、overrides（覆盖关系，如 ["stop","start"]）。
+  * 事件携带 command_id、source、command；分析器按统一时轴重建模式轨，
+    对同一设备的命令按时序仲裁（模式授权 -> 持令者/覆盖 -> 来源优先级
+    -> 同优先级互斥），把设备响应绑定到获胜来源；区分合法接管
+    legal_takeover、低优先级拒绝 low_priority_rejected、模式错配
+    mode_mismatch（错配仅被联锁拒绝记 mode_mismatch_rejected）、
+    互斥命令 mutex_command、过期执行 stale_execution、确认超时
+    ack_timeout。
+  * 模式记录缺失、command_id 重复（含孤儿执行）、来源多解、日志缺号或
+    时钟不可信时整条仲裁链保持 unknown；敞开窗口不臆断终态。
+  * 规则中不含 control 段的旧请求演算结果完全不变；归一化规则、模式轨、
+    选择链与采用事件引用固定进重放 JSON，改规则必须附 justification
+    另起修订，diff 给出 control 规则、获胜来源与结论差异。
 - 日志缺号 / 别名多解 / 校时残差越界 / 前置状态不明 -> 相应环节保持 unknown。
 - 重绑设备或改时钟锚点、改触发规则必须附 justification，系统另起修订并
   保留旧演算（重放 JSON 固定当时的归一化复合规则、组成事件与实例判定）。
@@ -62,7 +84,11 @@
 
 请求体（创建项目 / 新修订）示例见 simulate.py。字段约定:
 
-  devices          {设备号: {type, zone, ...}}
+  devices          {设备号: {type, zone, ...,
+                              # 控制模式档案（可选；仅 control 段需要）:
+                              control?: {modes: ["auto","panel","local"],
+                                signals: {mode: "模式切换信号名或 DEV:SIG"},
+                                default_mode?: "auto"}}}
   aliases          {别名: 设备号 或 [设备号, ...]}   # 多解即歧义
   matrix           [{id, trigger:{device,signal},                     # 旧写法，兼容
                      respond:[{device,signal,within_ms,after:["DEV:SIG"],
@@ -81,7 +107,17 @@
                                  primary?: "DEV:SIG",          # 缺省为本响应
                                  fault: "DEV:SIG", standby: "DEV:SIG",
                                  switch_wait_ms, total_ms, parallel_ms,
-                                 group?: "共享备用组名"}}]}]}
+                                 group?: "共享备用组名"},
+                               # 控制模式与命令仲裁（可选；不声明则维持原判定）:
+                               control:{
+                                 issue: "DEV:SIG", accept: "DEV:SIG",
+                                 reject: "DEV:SIG", execute?: "DEV:SIG",
+                                 commands?: ["start","stop"],  # 缺省=[signal]
+                                 sources?: ["auto","panel","local"],
+                                 authority?: {auto:["auto"], panel:["panel"],
+                                              local:["local"]},
+                                 ttl_ms: 命令有效期, ack_ms?: 确认时限,
+                                 overrides?: [["stop","start"]]}}]}]}
                     # 复合写法（trigger 旁并列 composite，或仅给 composite）:
                     {id, composite:{
                        all|any|k_of_n: [叶子, ...],
@@ -97,7 +133,13 @@
   sync_tolerance_ms  校时残差容限，默认 150
   sync_pulses      [{device, device_ts, master_ts}]
   bypass_permits   [{device, start, end, reason}]   # 统一时轴上的许可窗口
-  events           [{device, seq, signal, device_ts, value?, unit?}]
+  # 普通事件: {device, seq, signal, device_ts, value?, unit?}
+  # 模式切换: signal=模式信号, value="auto"|"panel"|"local"
+  # 命令生命周期: 下发/接受/拒绝记录携带 command_id/source/command，
+  #   拒绝可带 reason_code="mode_mismatch"|"low_priority"；
+  #   设备执行回执（start/stop）携带 command_id（可再带 command）。
+  events           [{device, seq, signal, device_ts, value?, unit?,
+                     command_id?, source?, command?, reason_code?}]
 
 """
 
@@ -166,6 +208,8 @@ def convert_unit(value, unit, base_unit):
 def evaluate(p):
     """对一份载荷做全量复核，返回结果 dict（可 JSON 序列化）。"""
     devices = set(p.get("devices", {}) or [])
+    devices_raw = p.get("devices", {}) or {}
+    devices_dict = devices_raw if isinstance(devices_raw, dict) else {}
     aliases = p.get("aliases", {}) or {}
     tol = p.get("sync_tolerance_ms", 150)
 
@@ -813,6 +857,262 @@ def evaluate(p):
                      "reason": "standby_group_ambiguous",
                      "detail": sorted(toks)}]
                 for g, toks in groups.items() if len(toks) > 1}
+
+    # ---------------------------------------------------- 控制模式与命令仲裁
+    # 现场设备（排烟风机等）可能处于 auto（联动自动）/panel（总线手动）/
+    # local（本地检修）三种控制模式；同一条 start/stop 命令可来自联动控制器、
+    # 值班员总线手动或本地检修开关。仅核对设备反馈分不清“当时谁拥有控制权”。
+    # respond 可声明 control 段：
+    #   issue / accept / reject / execute 给出命令生命周期四相事件的端点
+    #   （execute 缺省即本响应端点；命令清单缺省只含本响应 signal）；
+    #   sources 为来源优先级（高 -> 低）；authority 为各模式授权来源表；
+    #   ttl_ms 为命令有效期（下发后超期才执行 = 过期执行）；
+    #   ack_ms 为确认时限（accepted 后超期未终态 = 确认超时）；
+    #   overrides 为同设备命令的覆盖关系（["start","stop"] 表示 stop 覆盖
+    #   start）。设备档案 devices[d].control 声明模式切换信号 modes /
+    #  signals.mode 与默认模式 default_mode。分析器按统一时轴重建模式轨，
+    # 对每条命令选出有效命令并把响应绑定到获胜来源，区分合法接管、低优先级
+    # 拒绝、模式错配、互斥命令、过期执行；模式记录缺失、command_id 重复、
+    # 来源多解、日志缺号或时钟不可信 -> 该仲裁块保持 unknown。
+    _control_cache = {}
+    _CTRL_MODES = ("auto", "panel", "local")
+    _CTRL_DEFAULT_PRIORITY = ["auto", "panel", "local"]
+    _CTRL_DEFAULT_AUTHORITY = {
+        "auto": ["auto"], "panel": ["panel"], "local": ["local"]}
+
+    def ctrl_device_profile(device):
+        """归一化设备档案里的 control 段（模式声明与切换信号）。
+        返回 (profile, None) 或 (None, bad)；未声明 -> (None, None)。"""
+        info = devices_dict.get(device)
+        if not isinstance(info, dict) or "control" not in info:
+            return None, None
+        cp = info["control"]
+        if not isinstance(cp, dict):
+            return None, [{"member": f"devices:{device}:control",
+                           "reason": "invalid_control_profile"}]
+        bad = []
+        modes = cp.get("modes", list(_CTRL_MODES))
+        if not isinstance(modes, list) or not modes \
+                or any(not isinstance(m, str) or not m for m in modes):
+            bad.append({"member": f"devices:{device}:control:modes",
+                        "reason": "invalid_control_profile"})
+            modes = list(_CTRL_MODES)
+        sig = (cp.get("signals") or {}).get("mode") if isinstance(
+            cp.get("signals"), dict) else cp.get("mode_signal")
+        if not isinstance(sig, str) or not sig:
+            bad.append({"member": f"devices:{device}:control:signals:mode",
+                        "reason": "invalid_control_profile"})
+            sig = None
+        md, merr = None, None
+        if sig is not None:
+            if ":" in sig:
+                tok_dev, tok_sig = sig.split(":", 1)
+                md, merr = resolve(tok_dev)
+                sig = tok_sig
+            else:
+                md, merr = device, None
+        if merr:
+            bad.append({"member": f"devices:{device}:control:signals:mode",
+                        "reason": merr})
+        elif md is not None and md != device:
+            bad.append({"member": f"devices:{device}:control:signals:mode",
+                        "reason": "control_mode_signal_wrong_device",
+                        "detail": f"{md}:{sig}"})
+        default_mode = cp.get("default_mode")
+        if default_mode is not None and default_mode not in modes:
+            bad.append({"member": f"devices:{device}:control:default_mode",
+                        "reason": "invalid_control_profile",
+                        "detail": {"default_mode": default_mode,
+                                   "modes": modes}})
+        if bad:
+            return None, bad
+        return {"device": device, "modes": list(modes),
+                "mode_signal": sig, "default_mode": default_mode}, None
+
+    def parse_ctrl_endpoint(spec, tag, bad):
+        if isinstance(spec, str):
+            ds = spec.split(":", 1)
+            if len(ds) != 2:
+                bad.append({"member": tag, "reason": "invalid_control"})
+                return None
+            spec = {"device": ds[0], "signal": ds[1]}
+        if not isinstance(spec, dict) or not spec.get("device") \
+                or not spec.get("signal"):
+            bad.append({"member": tag, "reason": "invalid_control"})
+            return None
+        d, err = resolve(spec["device"])
+        if err:
+            bad.append({"member": f"{tag}:{spec['device']}", "reason": err})
+            return None
+        return {"device": d, "signal": spec["signal"]}
+
+    def normalize_control(resp):
+        """归一化 respond.control；结构非法 -> ({'invalid': [...]}, None)。"""
+        if "control" not in resp:
+            return None
+        key = id(resp)
+        if key in _control_cache:
+            return _control_cache[key]
+
+        def result(norm, valid):
+            _control_cache[key] = (norm, valid)
+            return _control_cache[key]
+
+        co = resp["control"]
+        if not isinstance(co, dict):
+            return result({"invalid": [{"member": "control",
+                                        "reason": "invalid_control"}]}, None)
+        bad = []
+        td, terr = resolve(resp.get("device"))
+        target_tok = f"{td}:{resp['signal']}" if not terr else None
+        if terr:
+            bad.append({"member": "control:target", "reason": terr})
+
+        ep_execute = {"device": td, "signal": resp["signal"]} if not terr \
+            else None
+        for ph in ("issue", "accept", "reject"):
+            if co.get(ph) is None:
+                bad.append({"member": f"control:{ph}",
+                            "reason": "invalid_control"})
+        ep_issue = parse_ctrl_endpoint(co.get("issue"),
+                                       "control:issue", bad)
+        ep_accept = parse_ctrl_endpoint(co.get("accept"),
+                                        "control:accept", bad)
+        ep_reject = parse_ctrl_endpoint(co.get("reject"),
+                                        "control:reject", bad)
+        if co.get("execute") is not None:
+            ep_execute = parse_ctrl_endpoint(co.get("execute"),
+                                             "control:execute", bad)
+            if ep_execute is not None and target_tok \
+                    and f"{ep_execute['device']}:{ep_execute['signal']}" \
+                    != target_tok:
+                bad.append({"member": "control:execute",
+                            "reason": "control_execute_mismatch",
+                            "detail": f"{ep_execute['device']}:"
+                                      f"{ep_execute['signal']}"})
+
+        def ms_field(name, required):
+            v = co.get(name)
+            if v is None:
+                if required:
+                    bad.append({"member": f"control:{name}",
+                                "reason": "invalid_control"})
+                return None
+            if isinstance(v, bool) or not isinstance(v, numbers.Real) \
+                    or int(v) < 0:
+                bad.append({"member": f"control:{name}",
+                            "reason": "invalid_control",
+                            "detail": {name: v}})
+                return None
+            return int(v)
+
+        ttl = ms_field("ttl_ms", True)
+        ack = ms_field("ack_ms", False)
+
+        commands = co.get("commands")
+        if commands is None:
+            commands = [resp.get("signal")]
+        if not isinstance(commands, list) or not commands \
+                or any(not isinstance(c, str) or not c for c in commands):
+            bad.append({"member": "control:commands",
+                        "reason": "invalid_control"})
+            commands = [resp.get("signal")]
+
+        sources = co.get("sources") or list(_CTRL_DEFAULT_PRIORITY)
+        if not isinstance(sources, list) or not sources \
+                or any(not isinstance(s, str) or not s for s in sources) \
+                or len(set(sources)) != len(sources):
+            bad.append({"member": "control:sources",
+                        "reason": "invalid_control"})
+            sources = list(_CTRL_DEFAULT_PRIORITY)
+
+        authority = co.get("authority")
+        if authority is None:
+            authority = {m: list(srcs) for m, srcs
+                         in _CTRL_DEFAULT_AUTHORITY.items()}
+        if not isinstance(authority, dict) or not authority:
+            bad.append({"member": "control:authority",
+                        "reason": "invalid_control"})
+            authority = {}
+        norm_auth = {}
+        for mode, srcs in authority.items():
+            if mode not in _CTRL_MODES or not isinstance(srcs, list) \
+                    or not srcs or any(s not in sources for s in srcs):
+                bad.append({"member": f"control:authority:{mode}",
+                            "reason": "invalid_control",
+                            "detail": srcs})
+                continue
+            norm_auth[mode] = list(srcs)
+
+        overrides = []
+        for i, ov in enumerate(co.get("overrides", []) or []):
+            if not isinstance(ov, list) or len(ov) != 2 \
+                    or any(c not in commands for c in ov):
+                bad.append({"member": f"control:overrides[{i}]",
+                            "reason": "invalid_control", "detail": ov})
+                continue
+            if ov[0] != ov[1]:
+                overrides.append([ov[0], ov[1]])
+        # 覆盖关系须无环（含自环）
+        graph = {}
+        for a, b in overrides:
+            graph.setdefault(a, set()).add(b)
+
+        def graph_has_cycle():
+            color = {}          # 0=在栈上, 1=已完成
+
+            def visit(node):
+                if color.get(node) == 0:
+                    return True
+                if color.get(node) == 1:
+                    return False
+                color[node] = 0
+                for nx in graph.get(node, ()):
+                    if visit(nx):
+                        return True
+                color[node] = 1
+                return False
+
+            return any(visit(n) for n in graph)
+
+        if graph_has_cycle():
+            bad.append({"member": "control:overrides",
+                        "reason": "control_override_cycle"})
+
+        profile, pbad = (ctrl_device_profile(td) if not terr
+                         else (None, None))
+        if pbad:
+            bad += pbad
+        if bad:
+            dedup, seen = [], set()
+            for b0 in bad:
+                k = (b0.get("member"), b0.get("reason"))
+                if k not in seen:
+                    seen.add(k)
+                    dedup.append(b0)
+            return result({"invalid": dedup}, None)
+        return result({
+            "target": target_tok,
+            "issue": f"{ep_issue['device']}:{ep_issue['signal']}",
+            "accept": f"{ep_accept['device']}:{ep_accept['signal']}",
+            "reject": f"{ep_reject['device']}:{ep_reject['signal']}",
+            "execute": f"{ep_execute['device']}:{ep_execute['signal']}",
+            "commands": list(commands), "sources": sources,
+            "authority": norm_auth, "ttl_ms": ttl, "ack_ms": ack,
+            "overrides": overrides, "profile": profile}, True)
+
+    def control_plan(rule):
+        """固定本规则各 respond 的归一化控制仲裁规则进重放 JSON。"""
+        out = []
+        for resp in rule.get("respond", []) or []:
+            if "control" not in resp:
+                continue
+            norm, valid = normalize_control(resp)
+            out.append({"target": (norm.get("target") if valid
+                                   else f"{resp.get('device')}:"
+                                        f"{resp.get('signal')}"),
+                        "valid": bool(valid), "rule": norm})
+        return out
 
     # ---------------------------------------------------- 复合触发引擎
     # 一个“触发实例”= 一轮火警。确认 = 组合在 window_ms 窗口内凑齐（
@@ -1499,6 +1799,7 @@ def evaluate(p):
     for rule in p.get("matrix", []) or []:
         plan = evidence_plan(rule)
         fo_plan = failover_plan(rule, failover_group_invalid)
+        ct_plan = control_plan(rule)
         if "composite" in rule:
             normalized, raw = eval_composite_rule(rule)
             if raw is None:  # 结构非法（别名多解/循环/k 越界/端点非法）
@@ -1534,7 +1835,7 @@ def evaluate(p):
                     inst = {"trigger_ts": r0["trigger_ts"], "kind": r0["kind"],
                             "status": st0, "members": r0["members"],
                             "gaps": r0["gaps"], "findings": findings}
-                    if fo_plan:
+                    if fo_plan or ct_plan:
                         inst["cap"] = r0["cap"]
                     instances.append(inst)
             sc_st = ("fail" if any(i["status"] == "fail" for i in instances)
@@ -1547,6 +1848,8 @@ def evaluate(p):
                 sc_obj["evidence_rules"] = plan
             if fo_plan:
                 sc_obj["failover_rules"] = fo_plan
+            if ct_plan:
+                sc_obj["control_rules"] = ct_plan
             scenarios.append(sc_obj)
             continue
 
@@ -1564,7 +1867,7 @@ def evaluate(p):
                 "findings": [{"type": "precondition_unknown", "status": "unknown",
                               "reason": terr or "trigger_not_observed",
                               "upstream": [trig["device"]]}]})
-        for tev in trig_evs:
+        for k_tev, tev in enumerate(trig_evs):
             t0 = tev["ts"]
             findings = []
             if tdev in untrusted:
@@ -1590,7 +1893,9 @@ def evaluate(p):
             st = ("fail" if any(f["status"] == "fail" for f in findings)
                   else "unknown" if any(f["status"] == "unknown" for f in findings)
                   else "pass")
-            instances.append({"trigger_ts": t0, "status": st, "findings": findings})
+            instances.append({"trigger_ts": t0, "status": st,
+                              "findings": findings,
+                              **({"cap": None} if ct_plan else {})})
         sc_st = ("fail" if any(i["status"] == "fail" for i in instances)
                  else "unknown" if any(i["status"] == "unknown" for i in instances)
                  else "pass")
@@ -1599,6 +1904,8 @@ def evaluate(p):
             sc_obj["evidence_rules"] = plan
         if fo_plan:
             sc_obj["failover_rules"] = fo_plan
+        if ct_plan:
+            sc_obj["control_rules"] = ct_plan
         scenarios.append(sc_obj)
 
 
@@ -3012,6 +3319,638 @@ def evaluate(p):
                                   for i in new_instances)
             else "pass")
 
+    # ---- 控制模式与命令仲裁（本地检修/总线手动/联动自动交错）----
+    # 仅对声明了 control 段的 respond 生效；未声明的旧请求演算结果完全不变。
+    # 按统一时轴重建设备模式轨，收集命令生命周期（下发/接受/拒绝/执行），
+    # 对同一设备的命令按时序仲裁：模式授权 -> 前持令者（覆盖关系）-> 来源
+    # 优先级 -> 同优先级互斥。设备反馈绑定到获胜命令来源，区分合法接管
+    # legal_takeover、低优先级拒绝 low_priority_rejected、模式错配
+    # mode_mismatch、互斥命令 mutex_command、过期执行 stale_execution、
+    # 确认超时 ack_timeout；模式记录缺失、command_id 重复、来源多解、
+    # 日志缺号或时钟不可信 -> 仲裁块保持 unknown。
+    ct_plans = []
+    for idx0, rule0 in enumerate(matrix_rules):
+        ct_plans.append({ent["target"]: ent
+                         for ent in scenarios[idx0].get("control_rules", [])})
+
+    def ctrl_ep(spec):
+        """'DEV:SIG' -> (dev, sig)。"""
+        return tuple(spec.split(":", 1))
+
+    # ---- 全局：command_id 重复（下发相记录重复出现即身份多解）----
+    # 同一命令的接受/拒绝/执行相携带同一 command_id 属正常生命周期，
+    # 不判重；判重只数下发相（source 与 command 齐备的下发记录）。
+    cmd_id_seen = {}        # cid -> 第一条下发记录
+    cmd_id_dup = set()
+    for e0 in events:
+        cid = e0.get("command_id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        if not e0.get("source") or not e0.get("command"):
+            continue
+        if e0.get("phase") not in (None, "issue"):
+            continue
+        if cid in cmd_id_seen:
+            cmd_id_dup.add(cid)
+        else:
+            cmd_id_seen[cid] = e0
+
+    def ctrl_mode_at(profile, ts, lo_ts=None):
+        """在统一时轴 ts 处设备处于何种控制模式。
+        返回 (mode, reason, gap)；无法坐实 -> (None, reason, gap)。
+        lo_ts：本轮起点；起点到 ts 之间的模式缺号可能藏切换 -> unknown。"""
+        mdev, msig = profile["device"], profile["mode_signal"]
+        if mdev in untrusted:
+            return None, "clock_residual_out_of_bounds", None
+        sw = sorted((e for e in by_dev.get(mdev, [])
+                     if e["signal"] == msig),
+                    key=lambda e: (e["ts"], e.get("seq") or 0))
+        prev = None
+        for e in sw:
+            if e["ts"] <= ts:
+                prev = e
+            else:
+                break
+        if prev is not None:
+            mode = prev.get("value") if prev.get("value") is not None \
+                else prev.get("mode")
+            if mode not in profile["modes"]:
+                return None, "control_mode_value_unknown", None
+            # 最近一次切换之后到 ts 的缺号可能藏另一次切换
+            g = next((g0 for g0 in gaps.get(mdev, [])
+                      if g0["from_seq"] > (prev.get("seq") or -10**18)
+                      and g0["to_ts"] >= prev["ts"]
+                      and g0["from_ts"] <= ts), None)
+            if g:
+                return None, "log_gap", g
+            return mode, None, None
+        # 无切换记录：默认模式可覆盖到首次切换之前；起点之后的缺号可能藏切换
+        if profile.get("default_mode") is not None:
+            g = None
+            if lo_ts is not None:
+                g = next((g0 for g0 in gaps.get(mdev, [])
+                          if g0["to_ts"] >= lo_ts
+                          and g0["from_ts"] <= ts), None)
+            if g:
+                return None, "log_gap", g
+            return profile["default_mode"], None, None
+        # 该设备在查询时段之前是否有任何日志：有日志但无模式记录 = 模式
+        # 记录缺失；完全无日志同样无法坐实初始模式。
+        return None, "control_mode_missing", None
+
+    def solve_control(plan_ent, inst, hi):
+        """逐触发实例仲裁一条设备控制链。hi：本轮命令窗口上界（cap/下一轮
+        触发/None=敞开）。"""
+        norm = plan_ent["rule"]
+        target = plan_ent["target"]
+        block = {"target": target, "rule": norm, "status": "unknown",
+                 "winner": None, "outcome": None, "mode_track": [],
+                 "commands": [], "findings": []}
+        t0 = inst.get("trigger_ts")
+
+        def add(status, ftype, reason, **extra):
+            f = {"type": ftype, "target": target,
+                 "upstream": [target], "status": status, "reason": reason}
+            f.update(extra)
+            block["findings"].append(f)
+            return f
+
+        def finish(status, outcome=None):
+            block["status"] = status
+            block["outcome"] = outcome
+            return block
+
+        if not plan_ent["valid"]:
+            for g0 in norm["invalid"]:
+                add("unknown", "control_precondition", g0["reason"],
+                    endpoint=g0.get("member"), detail=g0.get("detail"))
+            return finish("unknown")
+        if t0 is None:
+            add("unknown", "control_precondition", "trigger_not_confirmed")
+            return finish("unknown")
+
+        idev, isig = ctrl_ep(norm["issue"])
+        adev, asig = ctrl_ep(norm["accept"])
+        rdev, rsig = ctrl_ep(norm["reject"])
+        exdev, exsig = ctrl_ep(norm["execute"])
+        prof = norm["profile"]
+        commands_sig = norm["commands"]
+
+        # ---- 前置：任一相关设备时标不可信 ----
+        for dd in {idev, adev, rdev, exdev, prof["device"]}:
+            if dd in untrusted:
+                add("unknown", "control_precondition",
+                    "clock_residual_out_of_bounds", endpoint=dd)
+                return finish("unknown")
+
+        def phase_events(dev, sig):
+            return sorted((e for e in by_dev.get(dev, [])
+                           if e["signal"] == sig),
+                          key=lambda e: (e["ts"], e.get("seq") or 0))
+
+        # ---- 本轮起点的初始模式 + 各命令下发时模式，固定模式轨 ----
+        m0, mr0, mg0 = ctrl_mode_at(prof, t0)
+        block["mode_track"].append({"at": t0, "mode": m0,
+                                    "reason": mr0, "gap": mg0})
+        switches = sorted(
+            (e for e in by_dev.get(prof["device"], [])
+             if e["signal"] == prof["mode_signal"] and t0 < e["ts"]
+             and (hi is None or e["ts"] <= hi)),
+            key=lambda e: (e["ts"], e.get("seq") or 0))
+        for sw in switches:
+            mv = sw.get("value") if sw.get("value") is not None \
+                else sw.get("mode")
+            block["mode_track"].append({
+                "at": sw["ts"], "mode": mv if mv in prof["modes"] else None,
+                "reason": None if mv in prof["modes"]
+                else "control_mode_value_unknown",
+                "event": ev_ref(sw)})
+
+        # ---- 收集命令：下发端点携带 command_id/source/command 的记录 ----
+        issues = [e for e in phase_events(idev, isig)
+                  if t0 <= e["ts"] and (hi is None or e["ts"] <= hi)]
+        id_seen = {}
+        for e in phase_events(idev, isig):
+            cid = e.get("command_id")
+            if isinstance(cid, str) and cid:
+                id_seen.setdefault(cid, []).append(e)
+        dup_ids = {cid for cid, evs in id_seen.items() if len(evs) > 1}
+        taints = []                 # 使整块 unknown 的全局性问题
+        if m0 is None:
+            taints.append(("control_mode_missing" if mr0
+                           == "control_mode_missing" else mr0, mg0))
+        for mt in block["mode_track"][1:]:
+            if mt["mode"] is None:
+                taints.append((mt["reason"], None))
+
+        def source_of(e):
+            """来源唯一化；多解（列表多值）/缺失 -> (None, reason)。"""
+            s = e.get("source")
+            if isinstance(s, list):
+                vals = [x for x in s if isinstance(x, str) and x]
+                if len(vals) != 1 or len(s) != 1:
+                    return None, "command_source_ambiguous"
+                s = vals[0]
+            if not isinstance(s, str) or not s:
+                return None, "command_source_ambiguous"
+            return s, None
+
+        def command_of(e):
+            """该记录指向哪条命令（start/stop）：显式 command 字段，
+            否则仅单命令块按该命令归属。"""
+            c = e.get("command")
+            if isinstance(c, str) and c in commands_sig:
+                return c
+            if c is None and len(commands_sig) == 1:
+                return commands_sig[0]
+            return None
+
+        def gap_over(dev, lo, hii=None):
+            upper = hi if hii is None else hii
+            return next((g for g in gaps.get(dev, [])
+                         if g["to_ts"] >= lo
+                         and (upper is None or g["from_ts"] <= upper)),
+                        None)
+
+        recs = []
+        for ie in issues:
+            cid = ie.get("command_id")
+            src, serr = source_of(ie)
+            cmd = command_of(ie)
+            rec = {"id": cid, "issue": ev_ref(ie), "issue_ts": ie["ts"],
+                   "source": src, "command": cmd,
+                   "accept": None, "reject": None, "execute": None,
+                   "issue_event": ie}
+            block["commands"].append(
+                {k: v for k, v in rec.items() if k != "issue_event"})
+            recs.append(rec)
+            if not isinstance(cid, str) or not cid:
+                taints.append(("command_id_missing", None))
+                continue
+            if cid in dup_ids or cid in cmd_id_dup:
+                taints.append(("command_id_duplicate", None))
+                continue
+            if serr:
+                taints.append((serr, None))
+                continue
+            if cmd is None:
+                taints.append(("command_ambiguous", None))
+                continue
+            # 接受 / 拒绝：同一总线上按 command_id 匹配
+            acs = [e for e in phase_events(adev, asig)
+                   if e.get("command_id") == cid]
+            rjs = [e for e in phase_events(rdev, rsig)
+                   if e.get("command_id") == cid]
+            if len(acs) > 1 or len(rjs) > 1:
+                taints.append(("command_id_duplicate", None))
+                continue
+            rec["accept"] = ev_ref(acs[0]) if acs else None
+            rec["accept_ts"] = acs[0]["ts"] if acs else None
+            rec["reject"] = ev_ref(rjs[0]) if rjs else None
+            rec["reject_ts"] = rjs[0]["ts"] if rjs else None
+            # 执行：设备反馈按 command_id 匹配；信号取命令名（start/stop），
+            # 执行端点缺省为本响应信号；显式 command 字段须与命令一致。
+            def exec_events(sig):
+                return [e for e in by_dev.get(exdev, [])
+                        if e["signal"] == sig
+                        and e.get("command_id") == cid
+                        and (e.get("command") is None
+                             or e.get("command") == cmd)]
+            exs = exec_events(cmd) if cmd in commands_sig else []
+            if not exs and cmd == exsig:
+                exs = exec_events(exsig)
+            if len(exs) > 1:
+                taints.append(("command_id_duplicate", None))
+                continue
+            rec["execute"] = ev_ref(exs[0]) if exs else None
+            rec["execute_ts"] = exs[0]["ts"] if exs else None
+
+        # 孤儿执行：设备反馈带 command_id，但没有对应下发（可能漏采总线）
+        issue_ids = {r["id"] for r in recs if isinstance(r["id"], str)}
+        for csig in commands_sig:
+            for e in by_dev.get(exdev, []):
+                if e["signal"] != csig:
+                    continue
+                cid = e.get("command_id")
+                if isinstance(cid, str) and cid and cid not in issue_ids:
+                    taints.append(("command_orphan", None))
+
+        # ---- 全局性污染：模式/身份/缺号无法坐实 -> 整块 unknown ----
+        taint_reasons = []
+        for why, g0 in taints:
+            item = {"reason": why}
+            if g0:
+                item["gap"] = g0
+            if item not in taint_reasons:
+                taint_reasons.append(item)
+        # 命令窗口内任一参与设备缺号：可能漏掉另一条命令或模式切换
+        win_gap = None
+        for dd in {idev, adev, rdev}:
+            win_gap = gap_over(dd, t0)
+            if win_gap:
+                break
+        if win_gap is None:
+            win_gap = next((g for g in gaps.get(prof["device"], [])
+                            if g["to_ts"] >= t0
+                            and (hi is None or g["from_ts"] <= hi)), None)
+        if win_gap:
+            taint_reasons = [{"reason": "log_gap", "gap": win_gap}]
+        if taint_reasons:
+            for t in taint_reasons:
+                add("unknown", "control_precondition", t["reason"],
+                    **({"gap": t["gap"]} if t.get("gap") else {}))
+            return finish("unknown")
+
+        # ---- 逐命令仲裁：模式授权 -> 持令者/覆盖 -> 优先级 -> 互斥 ----
+        rank = {s: i for i, s in enumerate(norm["sources"])}
+        overrides = {(a, b) for a, b in norm["overrides"]}
+        ordered = sorted(recs, key=lambda r: (
+            r["issue_ts"], r["issue_event"].get("seq") or 0))
+        holder = None           # 最近一条在本设备上仍持有控制权的命令
+        decisions = {}          # id(rec) -> 决策 dict
+
+        def mode_at(ts):
+            m, why, _g = ctrl_mode_at(prof, ts, lo_ts=t0)
+            return m, why
+
+        # ---- 第一遍：身份 / 模式授权 / 拒绝回执 ----
+        for rec in ordered:
+            cid, src, cmd = rec["id"], rec["source"], rec["command"]
+            i_ts = rec["issue_ts"]
+            mode, mwhy = mode_at(i_ts)
+            dec = {"id": cid, "source": src, "command": cmd,
+                   "issue_ts": i_ts, "issue": rec["issue"],
+                   "mode": mode, "verdict": None, "reason": None}
+            decisions[id(rec)] = dec
+
+            if rec["reject"] is not None:
+                rj = next(e for e in phase_events(rdev, rsig)
+                          if e.get("command_id") == cid)
+                why_r = rj.get("reason_code") or rj.get("value")
+                mapping = {"low_priority": "low_priority_rejected",
+                           "priority": "low_priority_rejected",
+                           "mode_mismatch": "mode_mismatch_rejected",
+                           "mode": "mode_mismatch_rejected"}
+                dec["verdict"] = mapping.get(why_r) if isinstance(
+                    why_r, str) else "rejected"
+                dec.update(reject=rec["reject"], reject_ts=rec["reject_ts"])
+                continue
+            if mode is None:
+                dec.update(verdict="indeterminate",
+                           reason=mwhy or "control_mode_missing")
+                continue
+            dec["authorized"] = src in norm["authority"].get(mode, [])
+
+        # ---- 第二遍：模式错配 / 持令者 / 覆盖 / 优先级 / 互斥 / 终态 ----
+        def expired(rec):
+            return rec.get("execute_ts") is not None \
+                and rec["execute_ts"] - rec["issue_ts"] > norm["ttl_ms"]
+
+        for pos, rec in enumerate(ordered):
+            dec = decisions[id(rec)]
+            cid, src, cmd = dec["id"], dec["source"], dec["command"]
+            if dec["verdict"] is not None:
+                continue
+
+            # 模式错配（未被设备拒绝）：接受/执行 = 越权动作；联锁拒绝已在
+            # 第一遍归为 mode_mismatch_rejected；始终无终态则随窗口保持未知。
+            if not dec.get("authorized"):
+                dec.update(verdict="mode_mismatch",
+                           accept=rec["accept"], execute=rec["execute"],
+                           accept_ts=rec.get("accept_ts"),
+                           execute_ts=rec.get("execute_ts"))
+                if rec.get("execute_ts") is not None:
+                    holder = {"id": cid, "source": src, "command": cmd,
+                              "issue_ts": dec["issue_ts"]}
+                continue
+
+            # 与持令者的关系（不同命令才谈接管/拒绝/互斥）
+            takeover = False
+            if holder is not None and holder["command"] != cmd:
+                if (cmd, holder["command"]) in overrides:
+                    takeover = True
+                elif src in rank and holder["source"] in rank:
+                    if rank[src] < rank[holder["source"]]:
+                        takeover = True
+                    elif rank[src] == rank[holder["source"]]:
+                        dec.update(verdict="mutex_command",
+                                   accept=rec["accept"],
+                                   execute=rec["execute"],
+                                   accept_ts=rec.get("accept_ts"),
+                                   execute_ts=rec.get("execute_ts"),
+                                   conflicts_with=holder["id"])
+                        if rec.get("execute_ts") is not None:
+                            holder = {"id": cid, "source": src,
+                                      "command": cmd,
+                                      "issue_ts": dec["issue_ts"]}
+                        continue
+                    else:
+                        dec.update(verdict="low_priority_rejected",
+                                   accept=rec["accept"],
+                                   reject=rec["reject"],
+                                   conflicts_with=holder["id"])
+                        continue
+                elif rank.get(src, 999) > rank.get(holder["source"], -1):
+                    dec.update(verdict="low_priority_rejected",
+                               accept=rec["accept"], reject=rec["reject"],
+                               conflicts_with=holder["id"])
+                    continue
+
+            # 下发后超过命令有效期才落地 -> 过期执行；执行前模式已切离授权
+            # 或被后到的覆盖/高优先级命令夺权的回看在第二遍结束后统一做
+            # （需要未来命令的结论）。
+            if rec.get("execute_ts") is not None:
+                if expired(rec):
+                    verdict = "stale_execution"
+                    dec["expired"] = True
+                    dec["ttl_ms"] = norm["ttl_ms"]
+                elif takeover or (holder is not None
+                                  and holder["command"] != cmd):
+                    verdict = "legal_takeover"
+                else:
+                    verdict = "executed"
+                dec.update(verdict=verdict, accept=rec["accept"],
+                           execute=rec["execute"],
+                           accept_ts=rec.get("accept_ts"),
+                           execute_ts=rec.get("execute_ts"),
+                           took_over=holder["id"] if takeover else None)
+                holder = {"id": cid, "source": src, "command": cmd,
+                          "issue_ts": dec["issue_ts"]}
+                continue
+
+            if rec["accept"] is None:
+                # 接受与否不明：缺号已在上面拦；敞开窗口保持待确认
+                dec.update(verdict="indeterminate",
+                           reason=("control_window_open" if hi is None
+                                   else "command_not_accepted"))
+                continue
+
+            # 已接受但无终态：确认时限截止且采集已覆盖到截止之后 -> 超时；
+            # 接管命令（如停机）接受即取得控制权，终态可在后续窗口补来。
+            # 注意：扫描截止之后的日志时须排除本命令自身的执行记录（该记录
+            # 在上面已被取为 execute，只是在确认时限之后才到 = 延迟执行，
+            # 延迟是否非法由有效期 ttl 判定，不在此误报确认超时）。
+            ack_deadline = rec["accept_ts"] + norm["ack_ms"] \
+                if norm["ack_ms"] is not None else None
+            covered_after = False
+            if ack_deadline is not None:
+                own_execsigs = {(exdev, s) for s in commands_sig}
+
+                def own_late(e):
+                    return e.get("command_id") == cid \
+                        and (e["device"], e["signal"]) in own_execsigs
+
+                covered_after = any(
+                    e["ts"] > ack_deadline and not own_late(e)
+                    for dd in (exdev, idev, adev, rdev)
+                    for e in by_dev.get(dd, []))
+            if ack_deadline is not None and (
+                    (hi is not None and ack_deadline <= hi)
+                    or (hi is None and covered_after)):
+                dec.update(verdict="ack_timeout", accept=rec["accept"],
+                           accept_ts=rec["accept_ts"],
+                           deadline=ack_deadline)
+                continue
+            if takeover:
+                holder = {"id": cid, "source": src, "command": cmd,
+                          "issue_ts": dec["issue_ts"]}
+                dec.update(verdict="legal_takeover", accept=rec["accept"],
+                           accept_ts=rec["accept_ts"],
+                           took_over=holder["id"], terminal_pending=True)
+                continue
+            dec.update(verdict="indeterminate",
+                       reason=("control_window_open" if hi is None
+                               else "command_not_executed"),
+                       accept=rec["accept"], accept_ts=rec["accept_ts"])
+
+        # ---- 第三遍（回看）：执行前模式已切离授权，或执行前已被后到的
+        #      覆盖/高优先级命令夺权 -> 过期执行，撤销其持令资格 ----
+        def demote_stale(d, why):
+            d["verdict"] = "stale_execution"
+            d[why] = True
+            d.pop("took_over", None)
+
+        for pos, rec in enumerate(ordered):
+            d = decisions[id(rec)]
+            if d.get("execute_ts") is None or d["verdict"] in (
+                    "stale_execution", "mode_mismatch", "mutex_command",
+                    "low_priority_rejected", "mode_mismatch_rejected",
+                    "rejected", "ack_timeout", "indeterminate"):
+                continue
+            m_exec, _ = mode_at(d["execute_ts"])
+            if m_exec is not None and m_exec != d.get("mode"):
+                demote_stale(d, "mode_lapsed")
+                continue
+            for r2 in ordered[pos + 1:]:
+                d2 = decisions[id(r2)]
+                if not d2.get("authorized")                         or d2.get("execute_ts") is None                         or d2["issue_ts"] >= d["execute_ts"]:
+                    continue
+                stronger = ((d2["command"], d["command"]) in overrides
+                            or rank.get(d2["source"], 999)
+                            < rank.get(d["source"], -1)
+                            or d2.get("mode") != d.get("mode"))
+                if stronger:
+                    demote_stale(d, "superseded")
+                    break
+
+        # ---- 固定决策链进重放 JSON ----
+        chain_out = []
+        for rec in ordered:
+            d = decisions[id(rec)]
+            chain_out.append({k: v for k, v in d.items()
+                              if v is not None or k in ("execute", "accept",
+                                                        "reject")})
+        block["choice_chain"] = chain_out
+
+        # ---- 获胜来源：本轮最终合法持有控制权并实际驱动设备的命令 ----
+        # 过期/越权命令虽可能产生设备反馈，但不拥有控制权，不计为获胜者。
+        executed = [decisions[id(r)] for r in ordered
+                    if decisions[id(r)]["verdict"]
+                    in ("executed", "legal_takeover")
+                    and decisions[id(r)].get("execute_ts") is not None]
+        if executed:
+            last_ex = max(executed, key=lambda d: d["execute_ts"])
+            block["winner"] = {"id": last_ex["id"],
+                               "source": last_ex["source"],
+                               "command": last_ex["command"],
+                               "mode": last_ex.get("mode"),
+                               "execute_ts": last_ex["execute_ts"]}
+
+        # ---- 结论 findings：fail 类 / ok 类 / unknown 类分别登记 ----
+        VERDICT_FIND = {
+            "executed": ("ok", "control_command", "executed"),
+            "legal_takeover": ("ok", "control_takeover", "legal_takeover"),
+            "low_priority_rejected": ("ok", "control_arbitration",
+                                      "low_priority_rejected"),
+            "mode_mismatch_rejected": ("ok", "control_mode",
+                                       "mode_mismatch_rejected"),
+            "mode_mismatch": ("fail", "control_mode", "mode_mismatch"),
+            "mutex_command": ("fail", "control_mutex", "mutex_command"),
+            "stale_execution": ("fail", "control_command",
+                                "stale_execution"),
+            "ack_timeout": ("fail", "control_command", "ack_timeout"),
+            "rejected": ("fail", "control_command", "rejected"),
+        }
+        for d in chain_out:
+            v = d["verdict"]
+            if v in VERDICT_FIND:
+                st, ftype, why = VERDICT_FIND[v]
+                add(st, ftype, why, command_id=d["id"], source=d["source"],
+                    command=d["command"], mode=d.get("mode"),
+                    issue=d.get("issue"), accept=d.get("accept"),
+                    reject=d.get("reject"), execute=d.get("execute"),
+                    **({"conflicts_with": d["conflicts_with"]}
+                       if d.get("conflicts_with") else {}),
+                    **({"deadline": d["deadline"]}
+                       if d.get("deadline") is not None else {}),
+                    **({"ttl_ms": d["ttl_ms"]} if d.get("ttl_ms") else {}))
+            elif v == "indeterminate":
+                add("unknown", "control_command",
+                    d.get("reason") or "command_pending",
+                    command_id=d["id"], source=d.get("source"),
+                    command=d.get("command"), issue=d.get("issue"),
+                    accept=d.get("accept"))
+
+        has_fail = any(f["status"] == "fail" for f in block["findings"])
+        has_unknown = any(f["status"] == "unknown"
+                          for f in block["findings"])
+        outcome = None
+        if executed:
+            outcome = max(executed, key=lambda d: d["execute_ts"])["verdict"]
+        else:
+            verdicts = [d["verdict"] for d in chain_out
+                        if d["verdict"] not in (None, "indeterminate")]
+            if verdicts and len(set(verdicts)) == 1:
+                outcome = verdicts[0]
+        if has_fail:
+            return finish("fail", outcome)
+        if has_unknown:
+            return finish("unknown", outcome)
+        return finish("ok", outcome or "executed")
+
+    # 预求解：按规则/实例遍历。命令窗口上界只按实例边界（复合 cap /
+    # 下一轮触发）闭合；响应时限 within_ms 只约束设备反馈，不用来闭合命令
+    # 仲裁窗口——“启动该到了”不等于“晚到的命令不会再执行”。无上界=敞开，
+    # 已接受未终态命令随敞开窗口保持 unknown（确认时限后另有日志才判超时）。
+    ct_blocks = {}
+    for idx0, sc0 in enumerate(scenarios):
+        rules_by_target = ct_plans[idx0]
+        if not rules_by_target:
+            continue
+        trig_ts = sorted(i.get("trigger_ts") for i in sc0["instances"]
+                         if i.get("trigger_ts") is not None)
+        for j0, inst0 in enumerate(sc0["instances"]):
+            t0 = inst0.get("trigger_ts")
+            hi = inst0.get("cap")
+            if hi is None and t0 is not None:
+                hi = next((t for t in trig_ts if t > t0), None)
+            for target0, ent0 in rules_by_target.items():
+                ct_blocks[(idx0, j0, target0)] = solve_control(
+                    ent0, inst0, hi)
+
+    # 汇总进场景：每实例挂 control 块；仲裁失败（过期执行/互斥/确认超时/
+    # 错配执行）覆盖设备反馈的表面合格，证据不足保持 unknown。归一化规则、
+    # 模式轨、选择链与采用事件固定进重放 JSON。
+    for idx0, sc0 in enumerate(scenarios):
+        if not ct_plans[idx0]:
+            continue
+        new_instances = []
+        for j0, inst0 in enumerate(sc0["instances"]):
+            ni = dict(inst0)
+            added = []
+            block_by_target = {}
+            for target0 in ct_plans[idx0]:
+                block = ct_blocks.get((idx0, j0, target0))
+                if block is None:
+                    continue
+                ni.setdefault("control", []).append(block)
+                added += block["findings"]
+                block_by_target[target0] = block
+            merged = list(inst0.get("findings", [])) + added
+            superseded, shadowed = set(), set()
+            for target0, block in block_by_target.items():
+                bad_kinds = {"stale_execution", "mutex_command",
+                             "ack_timeout", "mode_mismatch", "rejected"}
+                has_bad = any(f.get("reason") in bad_kinds
+                              for f in block["findings"])
+                # 设备反馈（本响应 finding；超时时其 type=timeout）：若绑定
+                # 的获胜命令属非法裁决，表面合格被覆盖为 fail；仲裁 unknown
+                # 时随链保持 unknown。
+                rf = next((f for f in merged
+                           if f.get("target") == target0
+                           and f.get("type") in ("response", "timeout")),
+                          None)
+                if rf is not None:
+                    if block["status"] == "fail" and has_bad:
+                        rf["superseded_by"] = "control"
+                        superseded.add(id(rf))
+                    elif block["status"] == "unknown":
+                        rf["shadowed_by"] = "control"
+                        shadowed.add(id(rf))
+            for f in merged:
+                if f.get("type") == "timeout":
+                    f.pop("first", None)
+            timeouts = [f for f in merged if f.get("type") == "timeout"
+                        and id(f) not in superseded
+                        and id(f) not in shadowed]
+            if timeouts:
+                min(timeouts, key=lambda f: f["deadline"])["first"] = True
+            live = [f for f in merged
+                    if id(f) not in superseded and id(f) not in shadowed]
+            ni["findings"] = merged
+            ni["status"] = (
+                "fail" if any(f.get("status") == "fail" for f in live)
+                else "unknown"
+                if any(f.get("status") == "unknown" for f in live)
+                else "pass")
+            new_instances.append(ni)
+        sc0["instances"] = new_instances
+        sc0["status"] = (
+            "fail" if any(i["status"] == "fail" for i in new_instances)
+            else "unknown" if any(i["status"] == "unknown"
+                                  for i in new_instances)
+            else "pass")
+
     # ---- 互斥输出 ----
     mutex_findings = []
     for grp in p.get("mutex", []) or []:
@@ -3260,6 +4199,74 @@ def failover_changes(ra, rb):
     return changes
 
 
+def control_rule_canonical(rule):
+    """归一化控制仲裁规则的稳定投影：非法规则仅留 invalid，合法规则全字段。"""
+    if not isinstance(rule, dict):
+        return rule
+    if "invalid" in rule:
+        return {"invalid": rule["invalid"]}
+    return {k: rule.get(k) for k in
+            ("target", "issue", "accept", "reject", "execute", "commands",
+             "sources", "authority", "ttl_ms", "ack_ms", "overrides",
+             "profile")}
+
+
+def control_changes(ra, rb):
+    """对比两版结果中每个 respond 的控制仲裁：规则版本与结论差异。
+    旧版未声明 control 的 respond 不列出（保持原结果即可）。"""
+    def index(result):
+        out = {}
+        for sc in result.get("scenarios", []):
+            rules = {e["target"]: e
+                     for e in sc.get("control_rules", [])}
+            for inst in sc.get("instances", []):
+                for block in inst.get("control", []):
+                    plan = rules.get(block["target"])
+                    if plan is None:
+                        plan = {"target": block["target"], "valid": True,
+                                "rule": block.get("rule")}
+                    winner = block.get("winner")
+                    out[(sc["id"], inst.get("trigger_ts"),
+                         block["target"])] = {
+                        "rule": control_rule_canonical(plan.get("rule")),
+                        "status": block.get("status"),
+                        "outcome": block.get("outcome"),
+                        "winner": (None if not winner else
+                                   {"id": winner.get("id"),
+                                    "source": winner.get("source"),
+                                    "command": winner.get("command")})}
+        return out
+    ia, ib = index(ra), index(rb)
+    changes = []
+    for k in sorted(set(ia) | set(ib)):
+        a, b = ia.get(k), ib.get(k)
+        if a == b:
+            continue
+        item = {"scenario": k[0], "trigger_ts": k[1], "target": k[2]}
+        if a is None:
+            item["op"] = "add"
+            item["to"] = b
+        elif b is None:
+            item["op"] = "remove"
+            item["from"] = a
+        else:
+            item["op"] = "replace"
+            if a["rule"] != b["rule"]:
+                item["rule_changed"] = True
+                item["rule_from"] = a["rule"]
+                item["rule_to"] = b["rule"]
+            if (a["status"], a["outcome"], a["winner"]) != \
+                    (b["status"], b["outcome"], b["winner"]):
+                item["verdict_from"] = {"status": a["status"],
+                                        "outcome": a["outcome"],
+                                        "winner": a["winner"]}
+                item["verdict_to"] = {"status": b["status"],
+                                      "outcome": b["outcome"],
+                                      "winner": b["winner"]}
+        changes.append(item)
+    return changes
+
+
 # ---------------------------------------------------------------- HTTP 层
 
 REASONS = {200: "OK", 201: "Created", 400: "Bad Request",
@@ -3323,7 +4330,7 @@ def make_app(db_path):
         just = (body.get("justification") or "").strip()
         if not just:
             return 400, {"error": "重绑设备、改时钟锚点、改触发/复合规则、"
-                                 "改响应佐证或主备切换规则必须给出 "
+                                 "改响应佐证、主备切换或控制仲裁规则必须给出 "
                                  "justification 依据"}
         cur = conn.execute("SELECT MAX(rev) FROM revisions WHERE project=?",
                            (pid,)).fetchone()[0]
@@ -3354,7 +4361,7 @@ def make_app(db_path):
         conn.execute("UPDATE projects SET signed_off=1 WHERE id=?", (pid,))
         conn.commit()
         return 200, {"project": pid, "signed_off": True,
-                     "frozen": ["matrix", "events", "aliases"]}
+                     "frozen": ["matrix", "events", "aliases", "devices"]}
 
     def get_project(pid):
         row = conn.execute("SELECT name, created, signed_off FROM projects WHERE id=?",
@@ -3393,6 +4400,7 @@ def make_app(db_path):
             "verdict_changes": verdict_changes(ra["result"], rb["result"]),
             "evidence_changes": evidence_changes(ra["result"], rb["result"]),
             "failover_changes": failover_changes(ra["result"], rb["result"]),
+            "control_changes": control_changes(ra["result"], rb["result"]),
             "justification": rb["justification"]}
 
     def app(environ, start_response):
